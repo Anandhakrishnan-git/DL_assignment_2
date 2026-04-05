@@ -24,13 +24,12 @@ class VGG11Classifier(nn.Module):
         self.avgpool = nn.AdaptiveAvgPool2d((7, 7)) # Global average pooling to reduce spatial dimensions
         self.classifier = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(512 * 7 * 7, 4096),
+            nn.Linear(512 * 7 * 7, 512),
             nn.ReLU(inplace=True),
             CustomDropout(p=dropout_p),
-            #nn.Linear(4096, 4096),
-            #nn.ReLU(inplace=True),
-            #CustomDropout(p=dropout_p),
-            nn.Linear(4096, num_classes),
+            nn.Linear(512, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

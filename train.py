@@ -237,7 +237,7 @@ def main():
         f"Batches per epoch: {len(train_loader)}"
     )
 
-    model = VGG11Classifier(num_classes=37, dropout_p= 0.2).to(device)
+    model = VGG11Classifier(num_classes=37, dropout_p= 0.5).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.lr,
