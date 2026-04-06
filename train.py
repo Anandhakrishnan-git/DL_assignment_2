@@ -61,6 +61,13 @@ class AlbumentationsTransform:
                         hue=0.1,
                         p=0.5,
                     ),
+                    A.ColorJitter(
+                        brightness=0.3,
+                        contrast=0.3,
+                        saturation=0.3,
+                        hue=0.1,
+                        p=0.4,
+                    ),
                     A.RandomGamma(gamma_limit=(80, 120), p=0.2),
                     A.GaussianBlur(blur_limit=(3, 5), p=0.1),
                     A.CoarseDropout(
