@@ -49,11 +49,11 @@ class AlbumentationsTransform:
                         fill=0,
                         p=0.5,
                     ),
-                    # #A.Perspective(
-                    #     scale=(0.02, 0.05),
-                    #     keep_size=True,
-                    #     p=0.2,
-                    # ),
+                    A.Perspective(
+                        scale=(0.02, 0.05),
+                        keep_size=True,
+                        p=0.2,
+                    ),
                     A.ColorJitter(
                         brightness=0.2,
                         contrast=0.2,
@@ -61,15 +61,15 @@ class AlbumentationsTransform:
                         hue=0.1,
                         p=0.5,
                     ),
-                    #A.RandomGamma(gamma_limit=(80, 120), p=0.2),
-                    #A.GaussianBlur(blur_limit=(3, 5), p=0.1),
-                    # A.CoarseDropout(
-                    #     num_holes_range=(1, 8),
-                    #     hole_height_range=(0.04, 0.1),
-                    #     hole_width_range=(0.04, 0.1),
-                    #     fill=0,
-                    #     p=0.2,
-                    # ),
+                    A.RandomGamma(gamma_limit=(80, 120), p=0.2),
+                    A.GaussianBlur(blur_limit=(3, 5), p=0.1),
+                    A.CoarseDropout(
+                        num_holes_range=(1, 8),
+                        hole_height_range=(0.04, 0.1),
+                        hole_width_range=(0.04, 0.1),
+                        fill=0,
+                        p=0.2,
+                    ),
                     A.Normalize(mean=mean, std=std),
                     ToTensorV2(),
                 ]
@@ -391,6 +391,13 @@ def parse_args():
         default=1.0,
         help="Probability to apply MixUp/CutMix per batch.",
     )
+    parser.add_argument(
+        "--dropout_mode",
+        type=str,
+        choices=("element", "channel", "spatial"),
+        default="channel",
+        help="CustomDropout mode for the classifier head.",
+    )
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--save_path", type=str, default="classifier.pth")
@@ -438,7 +445,11 @@ def main():
         f"Batches per epoch: {len(train_loader)}"
     )
 
-    model = VGG11Classifier(num_classes=37, dropout_p= 0.6).to(device)
+    model = VGG11Classifier(
+        num_classes=37,
+        dropout_p=0.6,
+        dropout_mode=args.dropout_mode,
+    ).to(device)
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
             model.parameters(),
