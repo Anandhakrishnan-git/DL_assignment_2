@@ -198,6 +198,24 @@ def _grad_norm_l2(model: nn.Module) -> float:
     return total**0.5
 
 
+def _rand_bbox(size, lam: float):
+    """Generate CutMix bounding box."""
+    width = size[3]
+    height = size[2]
+    cut_rat = np.sqrt(1.0 - lam)
+    cut_w = int(width * cut_rat)
+    cut_h = int(height * cut_rat)
+
+    cx = np.random.randint(width)
+    cy = np.random.randint(height)
+
+    bbx1 = int(np.clip(cx - cut_w // 2, 0, width))
+    bby1 = int(np.clip(cy - cut_h // 2, 0, height))
+    bbx2 = int(np.clip(cx + cut_w // 2, 0, width))
+    bby2 = int(np.clip(cy + cut_h // 2, 0, height))
+    return bbx1, bby1, bbx2, bby2
+
+
 def train_one_epoch(
     model,
     loader,
@@ -205,6 +223,9 @@ def train_one_epoch(
     criterion,
     device: torch.device,
     log_interval: int,
+    mixup_alpha: float = 0.0,
+    cutmix_alpha: float = 0.0,
+    mix_prob: float = 1.0,
     debug_stats: bool = False,
     debug_batches: int = 0,
 ):
@@ -219,8 +240,34 @@ def train_one_epoch(
         labels = labels.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(images)
-        loss = criterion(logits, labels)
+        use_mix = (
+            (mixup_alpha > 0.0 or cutmix_alpha > 0.0)
+            and np.random.rand() < mix_prob
+        )
+        if use_mix and (mixup_alpha > 0.0 or cutmix_alpha > 0.0):
+            use_cutmix = False
+            if mixup_alpha > 0.0 and cutmix_alpha > 0.0:
+                use_cutmix = np.random.rand() < 0.5
+            elif cutmix_alpha > 0.0:
+                use_cutmix = True
+
+            if use_cutmix:
+                lam = np.random.beta(cutmix_alpha, cutmix_alpha)
+                rand_index = torch.randperm(images.size(0), device=images.device)
+                bbx1, bby1, bbx2, bby2 = _rand_bbox(images.size(), lam)
+                images[:, :, bby1:bby2, bbx1:bbx2] = images[rand_index, :, bby1:bby2, bbx1:bbx2]
+                lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (images.size(-1) * images.size(-2)))
+                labels_a, labels_b = labels, labels[rand_index]
+            else:
+                lam = np.random.beta(mixup_alpha, mixup_alpha)
+                rand_index = torch.randperm(images.size(0), device=images.device)
+                images = lam * images + (1 - lam) * images[rand_index]
+                labels_a, labels_b = labels, labels[rand_index]
+            logits = model(images)
+            loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
+        else:
+            logits = model(images)
+            loss = criterion(logits, labels)
         loss.backward()
 
         if debug_stats and batch_idx <= debug_batches:
@@ -293,7 +340,57 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        choices=("adam", "adamw"),
+        default="adamw",
+        help="Optimizer type.",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        choices=("none", "cosine", "plateau"),
+        default="cosine",
+        help="Learning rate scheduler.",
+    )
+    parser.add_argument(
+        "--min_lr",
+        type=float,
+        default=1e-6,
+        help="Minimum LR for cosine schedule.",
+    )
+    parser.add_argument(
+        "--lr_patience",
+        type=int,
+        default=3,
+        help="Plateau scheduler patience (epochs).",
+    )
+    parser.add_argument(
+        "--lr_factor",
+        type=float,
+        default=0.5,
+        help="Plateau scheduler decay factor.",
+    )
+    parser.add_argument(
+        "--mixup_alpha",
+        type=float,
+        default=0.0,
+        help="MixUp alpha (0 disables).",
+    )
+    parser.add_argument(
+        "--cutmix_alpha",
+        type=float,
+        default=0.0,
+        help="CutMix alpha (0 disables).",
+    )
+    parser.add_argument(
+        "--mix_prob",
+        type=float,
+        default=1.0,
+        help="Probability to apply MixUp/CutMix per batch.",
+    )
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--save_path", type=str, default="classifier.pth")
@@ -342,11 +439,32 @@ def main():
     )
 
     model = VGG11Classifier(num_classes=37, dropout_p= 0.6).to(device)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    scheduler = None
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr,
+        )
+    elif args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+        )
     criterion = nn.CrossEntropyLoss()
 
     best_acc = -1.0
@@ -360,15 +478,26 @@ def main():
             criterion,
             device,
             args.log_interval,
+            mixup_alpha=args.mixup_alpha,
+            cutmix_alpha=args.cutmix_alpha,
+            mix_prob=args.mix_prob,
             debug_stats=args.debug_stats,
             debug_batches=args.debug_batches,
         )
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
 
+        if scheduler is not None:
+            if args.lr_scheduler == "plateau":
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+
         print(
             f"Epoch {epoch}/{args.epochs} "
             f"- train: {train_loss:.4f} acc: {train_acc:.4f} "
-            f"- val: {val_loss:.4f} acc: {val_acc:.4f}"
+            f"- val: {val_loss:.4f} acc: {val_acc:.4f} "
+            f"- lr: {current_lr:.2e}"
         )
 
         if val_acc > best_acc:
