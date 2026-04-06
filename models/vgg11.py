@@ -43,6 +43,8 @@ class VGG11Encoder(nn.Module):
             nn.ReLU(inplace=True),
             #CustomDropout(p=0.2),  # Add dropout after conv blocks to help regularization
             nn.MaxPool2d(kernel_size=2, stride=2),
+            CustomDropout(p=0.2, mode="spatial"),  # Add dropout after conv blocks to help regularization
+
 
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
@@ -50,8 +52,9 @@ class VGG11Encoder(nn.Module):
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
-            #CustomDropout(p=0.4),  # Add dropout after conv blocks to help regularization
             nn.MaxPool2d(kernel_size=2, stride=2),
+            CustomDropout(p=0.2, mode="spatial"),  # Add dropout after conv blocks to help regularization
+
         )
 
     def forward(
