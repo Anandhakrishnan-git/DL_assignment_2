@@ -1,6 +1,7 @@
 """Training entrypoint for Oxford-IIIT Pet classification."""
 
 import argparse
+import inspect
 import os
 import time
 from typing import Tuple
@@ -10,6 +11,8 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset, random_split
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 from data.pets_dataset import OxfordIIITPetDataset
 from models import VGG11Classifier
@@ -19,23 +22,93 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-class ImageTransform:
+class AlbumentationsTransform:
     def __init__(
         self,
+        train: bool,
         size: int = IMAGE_SIZE,
         mean: Tuple[float, float, float] = IMAGENET_MEAN,
         std: Tuple[float, float, float] = IMAGENET_STD,
     ):
-        self.size = size
-        self.mean = np.array(mean, dtype=np.float32)
-        self.std = np.array(std, dtype=np.float32)
+        if train:
+            rrc = _build_random_resized_crop(
+                size=size,
+                scale=(0.7, 1.0),
+                ratio=(0.75, 1.33),
+                p=1.0,
+            )
+            self.transform = A.Compose(
+                [
+                    rrc,
+                    A.HorizontalFlip(p=0.5),
+                    A.ShiftScaleRotate(
+                        shift_limit=0.05,
+                        scale_limit=0.1,
+                        rotate_limit=15,
+                        border_mode=0,
+                        p=0.5,
+                    ),
+                    A.ColorJitter(
+                        brightness=0.2,
+                        contrast=0.2,
+                        saturation=0.2,
+                        hue=0.1,
+                        p=0.5,
+                    ),
+                    A.GaussianBlur(blur_limit=(3, 5), p=0.1),
+                    A.CoarseDropout(
+                        max_holes=8,
+                        max_height=int(0.1 * size),
+                        max_width=int(0.1 * size),
+                        min_holes=1,
+                        min_height=int(0.04 * size),
+                        min_width=int(0.04 * size),
+                        fill_value=0,
+                        p=0.2,
+                    ),
+                    A.Normalize(mean=mean, std=std),
+                    ToTensorV2(),
+                ]
+            )
+        else:
+            self.transform = A.Compose(
+                [
+                    A.Resize(height=size, width=size),
+                    A.Normalize(mean=mean, std=std),
+                    ToTensorV2(),
+                ]
+            )
 
     def __call__(self, image: Image.Image) -> torch.Tensor:
-        image = image.resize((self.size, self.size), resample=Image.BILINEAR)
-        arr = np.asarray(image, dtype=np.float32) / 255.0
-        arr = (arr - self.mean) / self.std
-        arr = np.transpose(arr, (2, 0, 1))
-        return torch.from_numpy(arr)
+        arr = np.asarray(image, dtype=np.uint8)
+        return self.transform(image=arr)["image"]
+
+
+def _build_random_resized_crop(
+    size: int,
+    scale: Tuple[float, float],
+    ratio: Tuple[float, float],
+    p: float,
+):
+    """Handle Albumentations API changes between versions."""
+    sig = inspect.signature(A.RandomResizedCrop)
+    params = sig.parameters
+    if "height" in params and "width" in params:
+        return A.RandomResizedCrop(
+            height=size,
+            width=size,
+            scale=scale,
+            ratio=ratio,
+            p=p,
+        )
+    if "size" in params:
+        return A.RandomResizedCrop(
+            size=(size, size),
+            scale=scale,
+            ratio=ratio,
+            p=p,
+        )
+    return A.RandomResizedCrop(size, size, scale=scale, ratio=ratio, p=p)
 
 
 def build_dataloaders(
@@ -44,26 +117,49 @@ def build_dataloaders(
     num_workers: int,
     val_ratio: float,
     overfit_subset: int = 0,
+    use_augmentation: bool = True,
 ):
-    transform = ImageTransform()
-
-    full_set = OxfordIIITPetDataset(
+    base_set = OxfordIIITPetDataset(
         root=root,
         split="trainval",
         tasks=("category",),
-        transform=transform,
+        transform=None,
     )
-    val_size = int(len(full_set) * val_ratio)
-    train_size = len(full_set) - val_size
+    val_size = int(len(base_set) * val_ratio)
+    train_size = len(base_set) - val_size
     generator = torch.Generator().manual_seed(42)
-    train_set, val_set = random_split(full_set, [train_size, val_size], generator=generator)
+    train_split, val_split = random_split(base_set, [train_size, val_size], generator=generator)
+
+    train_indices = list(train_split.indices)
+    val_indices = list(val_split.indices)
 
     if overfit_subset > 0:
-        subset_size = min(overfit_subset, len(train_set))
-        subset_indices = list(range(subset_size))
-        base_train = train_set
-        train_set = Subset(base_train, subset_indices)
-        val_set = Subset(base_train, subset_indices)
+        subset_size = min(overfit_subset, len(train_indices))
+        subset_indices = train_indices[:subset_size]
+        train_indices = subset_indices
+        val_indices = subset_indices
+
+    train_transform = AlbumentationsTransform(train=use_augmentation)
+    val_transform = AlbumentationsTransform(train=False)
+
+    train_set = Subset(
+        OxfordIIITPetDataset(
+            root=root,
+            split="trainval",
+            tasks=("category",),
+            transform=train_transform,
+        ),
+        train_indices,
+    )
+    val_set = Subset(
+        OxfordIIITPetDataset(
+            root=root,
+            split="trainval",
+            tasks=("category",),
+            transform=val_transform,
+        ),
+        val_indices,
+    )
 
     pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(
@@ -201,6 +297,11 @@ def parse_args():
     parser.add_argument("--save_path", type=str, default="classifier.pth")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument(
+        "--disable_aug",
+        action="store_true",
+        help="Disable training data augmentation.",
+    )
+    parser.add_argument(
         "--overfit_subset",
         type=int,
         default=0,
@@ -230,6 +331,7 @@ def main():
         num_workers=args.num_workers,
         val_ratio=args.val_ratio,
         overfit_subset=args.overfit_subset,
+        use_augmentation=not args.disable_aug,
     )
     print(
         f"Train size: {len(train_loader.dataset)} | "
