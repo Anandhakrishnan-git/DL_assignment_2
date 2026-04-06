@@ -234,8 +234,6 @@ def train_one_epoch(
                 f"feats_std: {feat_std:.6f}"
             )
         optimizer.step()
-        #print(f"Logits std: {logits.std().item()}")
-        #print(f"Grad norm: {torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).item()}")
 
 
         batch_size = images.size(0)
@@ -339,7 +337,7 @@ def main():
         f"Batches per epoch: {len(train_loader)}"
     )
 
-    model = VGG11Classifier(num_classes=37, dropout_p= 0.5).to(device)
+    model = VGG11Classifier(num_classes=37, dropout_p= 0.6).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.lr,
