@@ -25,13 +25,11 @@ class VGG11Classifier(nn.Module):
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Linear(512 * 7 * 7, 4096),
-            nn.BatchNorm1d(4096),
             nn.ReLU(inplace=True),
-            CustomDropout(p=0.6),
+            CustomDropout(p=0.5),
             nn.Linear(4096, 1024),
-            nn.BatchNorm1d(1024),
             nn.ReLU(inplace=True),
-            CustomDropout(p=0.8),
+            CustomDropout(p=0.5),
             nn.Linear(1024, num_classes),
         )
 
