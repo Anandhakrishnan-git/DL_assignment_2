@@ -41,12 +41,18 @@ class AlbumentationsTransform:
                 [
                     rrc,
                     A.HorizontalFlip(p=0.5),
-                    A.ShiftScaleRotate(
-                        shift_limit=0.05,
-                        scale_limit=0.1,
-                        rotate_limit=15,
+                    A.Affine(
+                        translate_percent=(-0.05, 0.05),
+                        scale=(0.9, 1.1),
+                        rotate=(-15, 15),
                         border_mode=0,
+                        fill=0,
                         p=0.5,
+                    ),
+                    A.Perspective(
+                        scale=(0.02, 0.05),
+                        keep_size=True,
+                        p=0.2,
                     ),
                     A.ColorJitter(
                         brightness=0.2,
@@ -55,15 +61,13 @@ class AlbumentationsTransform:
                         hue=0.1,
                         p=0.5,
                     ),
+                    A.RandomGamma(gamma_limit=(80, 120), p=0.2),
                     A.GaussianBlur(blur_limit=(3, 5), p=0.1),
                     A.CoarseDropout(
-                        max_holes=8,
-                        max_height=int(0.1 * size),
-                        max_width=int(0.1 * size),
-                        min_holes=1,
-                        min_height=int(0.04 * size),
-                        min_width=int(0.04 * size),
-                        fill_value=0,
+                        num_holes_range=(1, 8),
+                        hole_height_range=(0.04, 0.1),
+                        hole_width_range=(0.04, 0.1),
+                        fill=0,
                         p=0.2,
                     ),
                     A.Normalize(mean=mean, std=std),
