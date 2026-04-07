@@ -1,4 +1,4 @@
-"""Inference and evaluation for Oxford-IIIT Pet classification."""
+"""Inference and evaluation for Oxford-IIIT Pet classification/segmentation."""
 
 import argparse
 from typing import Tuple
@@ -12,7 +12,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from data.pets_dataset import OxfordIIITPetDataset
-from models import VGG11Classifier
+from models import VGG11Classifier, VGG11UNet
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -39,7 +39,26 @@ class AlbumentationsTransform:
         return self.transform(image=arr)["image"]
 
 
-def build_test_loader(root: str, batch_size: int, num_workers: int):
+class SegmentationTargetTransform:
+    """Convert segmentation masks to resized LongTensor targets."""
+
+    def __init__(self, size: int = IMAGE_SIZE):
+        self.size = size
+
+    def __call__(self, targets):
+        out = dict(targets)
+        if "segmentation" in out:
+            mask = out["segmentation"]
+            if not isinstance(mask, np.ndarray):
+                mask = np.asarray(mask, dtype=np.int64)
+            mask_img = Image.fromarray(mask.astype(np.uint8), mode="L")
+            mask_img = mask_img.resize((self.size, self.size), resample=Image.NEAREST)
+            mask_arr = np.array(mask_img, dtype=np.int64, copy=True)
+            out["segmentation"] = torch.tensor(mask_arr, dtype=torch.long)
+        return out
+
+
+def build_classification_test_loader(root: str, batch_size: int, num_workers: int):
     test_transform = AlbumentationsTransform()
     test_set = OxfordIIITPetDataset(
         root=root,
@@ -54,6 +73,27 @@ def build_test_loader(root: str, batch_size: int, num_workers: int):
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
+    )
+    return test_loader
+
+
+def build_segmentation_test_loader(root: str, batch_size: int, num_workers: int):
+    image_transform = AlbumentationsTransform()
+    target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
+    test_set = OxfordIIITPetDataset(
+        root=root,
+        split="test",
+        tasks=("segmentation",),
+        transform=image_transform,
+        target_transform=target_transform,
+    )
+    # Keep pin memory off to avoid rare Windows/CUDA pin-thread crashes.
+    test_loader = DataLoader(
+        test_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=False,
     )
     return test_loader
 
@@ -96,7 +136,7 @@ def _compute_classification_metrics(conf: np.ndarray):
     return metrics
 
 
-def evaluate(
+def evaluate_classification(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
@@ -150,13 +190,122 @@ def evaluate(
     return avg_loss, acc, topk_acc, metrics
 
 
+def _update_segmentation_confusion(
+    conf: np.ndarray,
+    targets: np.ndarray,
+    preds: np.ndarray,
+    num_classes: int,
+):
+    targets_flat = targets.reshape(-1)
+    preds_flat = preds.reshape(-1)
+    valid = (targets_flat >= 0) & (targets_flat < num_classes)
+    if not np.any(valid):
+        return
+    indices = num_classes * targets_flat[valid] + preds_flat[valid]
+    conf += np.bincount(indices, minlength=num_classes * num_classes).reshape(
+        num_classes, num_classes
+    )
+
+
+def _compute_segmentation_metrics(conf: np.ndarray):
+    tp = np.diag(conf).astype(np.float64)
+    fp = conf.sum(axis=0).astype(np.float64) - tp
+    fn = conf.sum(axis=1).astype(np.float64) - tp
+    support = conf.sum(axis=1).astype(np.float64)
+
+    denom = tp + fp + fn
+    iou = np.divide(tp, denom, out=np.zeros_like(tp), where=denom > 0)
+    valid = denom > 0
+    mean_iou = float(iou[valid].mean()) if np.any(valid) else 0.0
+    pixel_acc = float(tp.sum() / max(1.0, conf.sum()))
+
+    metrics = {
+        "iou": iou,
+        "support": support,
+        "pixel_acc": pixel_acc,
+        "mean_iou": mean_iou,
+    }
+    return metrics
+
+
+def evaluate_segmentation(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    criterion: nn.Module,
+    num_classes: int,
+):
+    model.eval()
+    running_loss = 0.0
+    total_samples = 0
+    conf = np.zeros((num_classes, num_classes), dtype=np.int64)
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device, non_blocking=device.type == "cuda")
+            masks = masks.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
+
+            logits = model(images)
+            loss = criterion(logits, masks)
+            preds = torch.argmax(logits, dim=1)
+
+            batch_size = images.size(0)
+            running_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+            _update_segmentation_confusion(
+                conf,
+                masks.detach().cpu().numpy(),
+                preds.detach().cpu().numpy(),
+                num_classes,
+            )
+
+    avg_loss = running_loss / max(1, total_samples)
+    metrics = _compute_segmentation_metrics(conf)
+    return avg_loss, metrics["pixel_acc"], metrics
+
+
+def _extract_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+            return checkpoint["state_dict"]
+        if "model_state_dict" in checkpoint and isinstance(
+            checkpoint["model_state_dict"], dict
+        ):
+            return checkpoint["model_state_dict"]
+        if all(isinstance(key, str) for key in checkpoint.keys()):
+            return checkpoint
+    raise ValueError("Unsupported checkpoint format; expected a state_dict-like mapping.")
+
+
+def _strip_module_prefix(state_dict):
+    if not any(key.startswith("module.") for key in state_dict):
+        return state_dict
+    return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
+
+
+def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = _strip_module_prefix(_extract_state_dict(checkpoint))
+    model.load_state_dict(state_dict)
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--task",
+        type=str,
+        choices=("classification", "segmentation"),
+        default="classification",
+        help="Inference task.",
+    )
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--classifier_path", type=str, default="classifier.pth")
+    parser.add_argument("--unet_path", type=str, default="unet.pth")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--num_classes", type=int, default=37)
+    parser.add_argument("--seg_num_classes", type=int, default=3)
     parser.add_argument(
         "--dropout_mode",
         type=str,
@@ -179,16 +328,18 @@ def parse_args():
     parser.add_argument(
         "--print_per_class",
         action="store_true",
-        help="Print per-class precision/recall/F1/accuracy.",
+        help="Print per-class precision/recall/F1/accuracy for classification.",
+    )
+    parser.add_argument(
+        "--print_seg_per_class",
+        action="store_true",
+        help="Print per-class IoU/support for segmentation.",
     )
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    test_loader = build_test_loader(
+def run_classification_inference(args, device: torch.device):
+    test_loader = build_classification_test_loader(
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -203,14 +354,12 @@ def main():
         dropout_p=args.dropout_p,
         dropout_mode=args.dropout_mode,
     ).to(device)
-
-    state = torch.load(args.classifier_path, map_location=device)
-    model.load_state_dict(state)
+    load_checkpoint(model, args.classifier_path, device)
 
     criterion = nn.CrossEntropyLoss()
 
     print(f"Using device: {device}")
-    avg_loss, acc, topk_acc, metrics = evaluate(
+    avg_loss, acc, topk_acc, metrics = evaluate_classification(
         model=model,
         loader=test_loader,
         device=device,
@@ -243,6 +392,53 @@ def main():
                 f"prec={precision:.4f} rec={recall:.4f} "
                 f"f1={f1:.4f} acc={class_acc:.4f}"
             )
+
+
+def run_segmentation_inference(args, device: torch.device):
+    test_loader = build_segmentation_test_loader(
+        root=args.data_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+    print(
+        f"Test size: {len(test_loader.dataset)} | "
+        f"Batches: {len(test_loader)}"
+    )
+
+    model = VGG11UNet(num_classes=args.seg_num_classes).to(device)
+    load_checkpoint(model, args.unet_path, device)
+    criterion = nn.CrossEntropyLoss()
+
+    print(f"Using device: {device}")
+    avg_loss, pixel_acc, metrics = evaluate_segmentation(
+        model=model,
+        loader=test_loader,
+        device=device,
+        criterion=criterion,
+        num_classes=args.seg_num_classes,
+    )
+
+    print(f"Segmentation test loss: {avg_loss:.4f}")
+    print(f"Segmentation pixel accuracy: {pixel_acc:.4f}")
+    print(f"Segmentation mean IoU: {metrics['mean_iou']:.4f}")
+
+    if args.print_seg_per_class:
+        print("Per-class metrics (index: support, iou):")
+        for idx in range(args.seg_num_classes):
+            support = int(metrics["support"][idx])
+            iou = metrics["iou"][idx]
+            print(f"{idx:02d}: support={support} iou={iou:.4f}")
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.task == "segmentation":
+        run_segmentation_inference(args, device)
+        return
+
+    run_classification_inference(args, device)
 
 
 if __name__ == "__main__":
