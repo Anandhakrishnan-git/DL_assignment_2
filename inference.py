@@ -1,6 +1,7 @@
 """Inference and evaluation for Oxford-IIIT Pet classification/segmentation."""
 
 import argparse
+import os
 from typing import Tuple
 
 import numpy as np
@@ -228,6 +229,106 @@ def _compute_segmentation_metrics(conf: np.ndarray):
     return metrics
 
 
+def _unnormalize_image(image_tensor: torch.Tensor) -> np.ndarray:
+    image = image_tensor.detach().cpu().float().permute(1, 2, 0).numpy()
+    image = image * np.array(IMAGENET_STD, dtype=np.float32) + np.array(
+        IMAGENET_MEAN, dtype=np.float32
+    )
+    image = np.clip(image, 0.0, 1.0)
+    return (image * 255.0).astype(np.uint8)
+
+
+def _colorize_segmentation_mask(mask: np.ndarray, num_classes: int) -> np.ndarray:
+    if num_classes == 3:
+        return OxfordIIITPetDataset.colorize_segmentation_mask(mask)
+
+    palette = np.stack(
+        [
+            (37 * np.arange(num_classes)) % 255,
+            (67 * np.arange(num_classes)) % 255,
+            (97 * np.arange(num_classes)) % 255,
+        ],
+        axis=1,
+    ).astype(np.uint8)
+    mask_clipped = np.clip(mask, 0, num_classes - 1).astype(np.int64)
+    return palette[mask_clipped]
+
+
+def visualize_segmentation_prediction(
+    model: nn.Module,
+    root: str,
+    device: torch.device,
+    num_classes: int,
+    sample_index: int,
+    out_dir: str,
+    prefix: str,
+    alpha: float,
+):
+    image_transform = AlbumentationsTransform()
+    target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
+    dataset = OxfordIIITPetDataset(
+        root=root,
+        split="test",
+        tasks=("segmentation",),
+        transform=image_transform,
+        target_transform=target_transform,
+    )
+
+    if len(dataset) == 0:
+        raise RuntimeError("Empty test dataset; cannot visualize segmentation output.")
+
+    if sample_index < 0:
+        sample_index = int(np.random.randint(0, len(dataset)))
+    sample_index = int(sample_index % len(dataset))
+
+    image_tensor, gt_mask = dataset[sample_index]
+    image_batch = image_tensor.unsqueeze(0).to(device, non_blocking=device.type == "cuda")
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(image_batch)
+        pred_mask = torch.argmax(logits, dim=1).squeeze(0).detach().cpu().numpy().astype(np.int64)
+
+    gt_mask_np = gt_mask.detach().cpu().numpy().astype(np.int64)
+    image_np = _unnormalize_image(image_tensor)
+    pred_color = _colorize_segmentation_mask(pred_mask, num_classes)
+    gt_color = _colorize_segmentation_mask(gt_mask_np, num_classes)
+
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    pred_overlay = ((1.0 - alpha) * image_np + alpha * pred_color).astype(np.uint8)
+    gt_overlay = ((1.0 - alpha) * image_np + alpha * gt_color).astype(np.uint8)
+
+    panel = np.concatenate(
+        [image_np, gt_color, pred_color, gt_overlay, pred_overlay],
+        axis=1,
+    )
+
+    os.makedirs(out_dir, exist_ok=True)
+    base = f"{prefix}_idx_{sample_index:04d}"
+    image_path = os.path.join(out_dir, f"{base}_image.png")
+    gt_path = os.path.join(out_dir, f"{base}_gt_mask.png")
+    pred_path = os.path.join(out_dir, f"{base}_pred_mask.png")
+    gt_overlay_path = os.path.join(out_dir, f"{base}_gt_overlay.png")
+    pred_overlay_path = os.path.join(out_dir, f"{base}_pred_overlay.png")
+    panel_path = os.path.join(out_dir, f"{base}_panel.png")
+
+    Image.fromarray(image_np).save(image_path)
+    Image.fromarray(gt_color).save(gt_path)
+    Image.fromarray(pred_color).save(pred_path)
+    Image.fromarray(gt_overlay).save(gt_overlay_path)
+    Image.fromarray(pred_overlay).save(pred_overlay_path)
+    Image.fromarray(panel).save(panel_path)
+
+    print("Saved segmentation visualization:")
+    print(f"  sample index: {sample_index}")
+    print(f"  image: {image_path}")
+    print(f"  gt mask: {gt_path}")
+    print(f"  pred mask: {pred_path}")
+    print(f"  gt overlay: {gt_overlay_path}")
+    print(f"  pred overlay: {pred_overlay_path}")
+    print(f"  panel: {panel_path}")
+
+
 def evaluate_segmentation(
     model: nn.Module,
     loader: DataLoader,
@@ -335,6 +436,40 @@ def parse_args():
         action="store_true",
         help="Print per-class IoU/support for segmentation.",
     )
+    parser.add_argument(
+        "--save_seg_viz",
+        action="store_true",
+        help="Save segmentation prediction visualization for one test sample.",
+    )
+    parser.add_argument(
+        "--seg_viz_index",
+        type=int,
+        default=0,
+        help="Test sample index for segmentation visualization (-1 selects random).",
+    )
+    parser.add_argument(
+        "--seg_viz_dir",
+        type=str,
+        default="segmentation_viz",
+        help="Directory where segmentation visualization files are saved.",
+    )
+    parser.add_argument(
+        "--seg_viz_prefix",
+        type=str,
+        default="segmentation_test",
+        help="Filename prefix for saved segmentation visualization files.",
+    )
+    parser.add_argument(
+        "--seg_viz_alpha",
+        type=float,
+        default=0.35,
+        help="Overlay alpha for segmentation visualization in [0, 1].",
+    )
+    parser.add_argument(
+        "--seg_viz_only",
+        action="store_true",
+        help="Only save segmentation visualization and skip full test evaluation.",
+    )
     return parser.parse_args()
 
 
@@ -395,6 +530,23 @@ def run_classification_inference(args, device: torch.device):
 
 
 def run_segmentation_inference(args, device: torch.device):
+    model = VGG11UNet(num_classes=args.seg_num_classes).to(device)
+    load_checkpoint(model, args.unet_path, device)
+    criterion = nn.CrossEntropyLoss()
+
+    if args.seg_viz_only:
+        visualize_segmentation_prediction(
+            model=model,
+            root=args.data_root,
+            device=device,
+            num_classes=args.seg_num_classes,
+            sample_index=args.seg_viz_index,
+            out_dir=args.seg_viz_dir,
+            prefix=args.seg_viz_prefix,
+            alpha=args.seg_viz_alpha,
+        )
+        return
+
     test_loader = build_segmentation_test_loader(
         root=args.data_root,
         batch_size=args.batch_size,
@@ -404,10 +556,6 @@ def run_segmentation_inference(args, device: torch.device):
         f"Test size: {len(test_loader.dataset)} | "
         f"Batches: {len(test_loader)}"
     )
-
-    model = VGG11UNet(num_classes=args.seg_num_classes).to(device)
-    load_checkpoint(model, args.unet_path, device)
-    criterion = nn.CrossEntropyLoss()
 
     print(f"Using device: {device}")
     avg_loss, pixel_acc, metrics = evaluate_segmentation(
@@ -428,6 +576,18 @@ def run_segmentation_inference(args, device: torch.device):
             support = int(metrics["support"][idx])
             iou = metrics["iou"][idx]
             print(f"{idx:02d}: support={support} iou={iou:.4f}")
+
+    if args.save_seg_viz:
+        visualize_segmentation_prediction(
+            model=model,
+            root=args.data_root,
+            device=device,
+            num_classes=args.seg_num_classes,
+            sample_index=args.seg_viz_index,
+            out_dir=args.seg_viz_dir,
+            prefix=args.seg_viz_prefix,
+            alpha=args.seg_viz_alpha,
+        )
 
 
 def main():
