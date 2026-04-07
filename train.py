@@ -192,7 +192,7 @@ class SegmentationTargetTransform:
             mask = out["segmentation"]
             if not isinstance(mask, np.ndarray):
                 mask = np.asarray(mask, dtype=np.int64)
-            mask_img = Image.fromarray(mask.astype(np.uint8), mode="L")
+            mask_img = Image.fromarray(mask.astype(np.uint8))
             mask_img = mask_img.resize((self.size, self.size), resample=Image.NEAREST)
             # Force an owning, contiguous CPU array before tensor conversion.
             mask_arr = np.array(mask_img, dtype=np.int64, copy=True)
