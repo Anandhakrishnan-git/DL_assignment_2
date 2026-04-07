@@ -57,13 +57,7 @@ class AlbumentationsTransform:
                         hue=0.05,
                         p=0.3,
                     ),
-                    A.ColorJitter(
-                        brightness=0.3,
-                        contrast=0.3,
-                        saturation=0.3,
-                        hue=0.1,
-                        p=0.4,
-                    ),
+
                     #A.RandomGamma(gamma_limit=(80, 120), p=0.2),
                     #A.GaussianBlur(blur_limit=(3, 5), p=0.1),
                     A.CoarseDropout(
@@ -189,6 +183,33 @@ def build_dataloaders(
 def _accuracy(logits: torch.Tensor, targets: torch.Tensor) -> int:
     preds = torch.argmax(logits, dim=1)
     return (preds == targets).sum().item()
+
+
+def _init_classifier_weights(module: nn.Module) -> None:
+    """Initialize VGG-style modules for ReLU activations."""
+    if isinstance(module, nn.Conv2d):
+        nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Linear):
+        nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="relu")
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+        if module.weight is not None:
+            nn.init.ones_(module.weight)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+
+def initialize_model_weights(model: VGG11Classifier) -> None:
+    """Apply custom initialization and soften the logits layer scale."""
+    model.apply(_init_classifier_weights)
+    final_layer = model.classifier[-1]
+    if isinstance(final_layer, nn.Linear):
+        nn.init.normal_(final_layer.weight, mean=0.0, std=0.01)
+        if final_layer.bias is not None:
+            nn.init.zeros_(final_layer.bias)
 
 
 def _grad_norm_l2(model: nn.Module) -> float:
@@ -641,7 +662,9 @@ def main():
         num_classes=37,
         dropout_p=0.5,
         dropout_mode=args.dropout_mode,
-    ).to(device)
+    )
+    initialize_model_weights(model)
+    model = model.to(device)
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
             model.parameters(),
