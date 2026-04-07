@@ -4,7 +4,6 @@
 import torch
 import torch.nn as nn
 
-from .layers import CustomDropout
 from .vgg11 import VGG11Encoder
 
 class VGG11UNet(nn.Module):
@@ -28,7 +27,6 @@ class VGG11UNet(nn.Module):
         self.dec1 = nn.Sequential(
             nn.Conv2d(1024, 512, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            CustomDropout(p=dropout_p),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )
@@ -37,7 +35,6 @@ class VGG11UNet(nn.Module):
         self.dec2 = nn.Sequential(
             nn.Conv2d(768, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            CustomDropout(p=dropout_p),
             nn.Conv2d(256, 256, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )
@@ -46,7 +43,6 @@ class VGG11UNet(nn.Module):
         self.dec3 = nn.Sequential(
             nn.Conv2d(384, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            CustomDropout(p=dropout_p),
             nn.Conv2d(128, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )
@@ -55,7 +51,6 @@ class VGG11UNet(nn.Module):
         self.dec4 = nn.Sequential(
             nn.Conv2d(192, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            CustomDropout(p=dropout_p),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )
@@ -64,7 +59,6 @@ class VGG11UNet(nn.Module):
         self.dec5 = nn.Sequential(
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            CustomDropout(p=dropout_p),
             nn.Conv2d(64, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
         )

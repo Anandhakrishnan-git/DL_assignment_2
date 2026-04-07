@@ -16,17 +16,19 @@ class VGG11Encoder(nn.Module):
         """Initialize the VGG11Encoder model."""
         super().__init__()
 
-        self.encoder = nn.Sequential(
+        block_1 = [
             nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-
+        ]
+        block_2 = [
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-
+        ]
+        block_3 = [
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
@@ -34,18 +36,18 @@ class VGG11Encoder(nn.Module):
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-
+        ]
+        block_4 = [
             nn.Conv2d(256, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
-            #CustomDropout(p=0.2),  # Add dropout after conv blocks to help regularization
             nn.MaxPool2d(kernel_size=2, stride=2),
             CustomDropout(p=0.2, mode="spatial"),  # Add dropout after conv blocks to help regularization
-
-
+        ]
+        block_5 = [
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
@@ -54,7 +56,13 @@ class VGG11Encoder(nn.Module):
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
             CustomDropout(p=0.2, mode="spatial"),  # Add dropout after conv blocks to help regularization
-
+        ]
+        self.encoder = nn.Sequential(
+            *block_1,
+            *block_2,
+            *block_3,
+            *block_4,
+            *block_5,
         )
 
     def forward(
@@ -79,7 +87,7 @@ class VGG11Encoder(nn.Module):
                 "block2": self.encoder[0:7](f),  # after second conv+bn+relu
                 "block3": self.encoder[0:14](f),  # after third block convs
                 "block4": self.encoder[0:21](f),  # after fourth block convs
-                "block5": self.encoder[0:28](f),  # after fifth block convs
+                "block5": self.encoder[0:29](f),  # after fifth block convs
             }
             return x, features
 

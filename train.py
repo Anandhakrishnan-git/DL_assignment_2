@@ -16,7 +16,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from data.pets_dataset import OxfordIIITPetDataset
-from models import VGG11Classifier
+from models import VGG11Classifier, VGG11UNet
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -180,6 +180,99 @@ def build_dataloaders(
     return train_loader, val_loader
 
 
+class SegmentationTargetTransform:
+    """Convert segmentation masks to resized LongTensor targets."""
+
+    def __init__(self, size: int = IMAGE_SIZE):
+        self.size = size
+
+    def __call__(self, targets):
+        out = dict(targets)
+        if "segmentation" in out:
+            mask = out["segmentation"]
+            if not isinstance(mask, np.ndarray):
+                mask = np.asarray(mask, dtype=np.int64)
+            mask_img = Image.fromarray(mask.astype(np.uint8), mode="L")
+            mask_img = mask_img.resize((self.size, self.size), resample=Image.NEAREST)
+            # Force an owning, contiguous CPU array before tensor conversion.
+            mask_arr = np.array(mask_img, dtype=np.int64, copy=True)
+            out["segmentation"] = torch.tensor(mask_arr, dtype=torch.long)
+        return out
+
+
+def build_segmentation_dataloaders(
+    root: str,
+    batch_size: int,
+    num_workers: int,
+    val_ratio: float,
+    overfit_subset: int = 0,
+):
+    """Build segmentation dataloaders with aligned image/mask resizing."""
+    base_set = OxfordIIITPetDataset(
+        root=root,
+        split="trainval",
+        tasks=("segmentation",),
+        transform=None,
+        target_transform=None,
+    )
+    val_size = int(len(base_set) * val_ratio)
+    train_size = len(base_set) - val_size
+    generator = torch.Generator().manual_seed(42)
+    train_split, val_split = random_split(base_set, [train_size, val_size], generator=generator)
+
+    train_indices = list(train_split.indices)
+    val_indices = list(val_split.indices)
+
+    if overfit_subset > 0:
+        subset_size = min(overfit_subset, len(train_indices))
+        subset_indices = train_indices[:subset_size]
+        train_indices = subset_indices
+        val_indices = subset_indices
+
+    image_transform = AlbumentationsTransform(train=False)
+    target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
+
+    train_set = Subset(
+        OxfordIIITPetDataset(
+            root=root,
+            split="trainval",
+            tasks=("segmentation",),
+            transform=image_transform,
+            target_transform=target_transform,
+        ),
+        train_indices,
+    )
+    val_set = Subset(
+        OxfordIIITPetDataset(
+            root=root,
+            split="trainval",
+            tasks=("segmentation",),
+            transform=image_transform,
+            target_transform=target_transform,
+        ),
+        val_indices,
+    )
+
+    # Keep pin_memory off for segmentation on Windows/CUDA to avoid
+    # intermittent "cudaErrorAlreadyMapped" from DataLoader pin threads.
+    pin_memory = False
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    return train_loader, val_loader
+
+
 def _accuracy(logits: torch.Tensor, targets: torch.Tensor) -> int:
     preds = torch.argmax(logits, dim=1)
     return (preds == targets).sum().item()
@@ -187,7 +280,7 @@ def _accuracy(logits: torch.Tensor, targets: torch.Tensor) -> int:
 
 def _init_classifier_weights(module: nn.Module) -> None:
     """Initialize VGG-style modules for ReLU activations."""
-    if isinstance(module, nn.Conv2d):
+    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
         nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
         if module.bias is not None:
             nn.init.zeros_(module.bias)
@@ -484,8 +577,183 @@ def evaluate(model, loader, criterion, device: torch.device):
     return avg_loss, avg_acc
 
 
+def _update_segmentation_confusion(
+    confusion: torch.Tensor,
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    num_classes: int,
+) -> None:
+    preds = preds.detach().view(-1).to(dtype=torch.int64)
+    targets = targets.detach().view(-1).to(dtype=torch.int64)
+    valid = (targets >= 0) & (targets < num_classes)
+    if valid.any():
+        encoded = (num_classes * targets[valid] + preds[valid]).cpu()
+        bincount = torch.bincount(encoded, minlength=num_classes * num_classes)
+        confusion += bincount.view(num_classes, num_classes)
+
+
+def _mean_iou_from_confusion(confusion: torch.Tensor, eps: float = 1e-6) -> float:
+    conf = confusion.to(dtype=torch.float32)
+    true_pos = torch.diag(conf)
+    false_pos = conf.sum(dim=0) - true_pos
+    false_neg = conf.sum(dim=1) - true_pos
+    denom = true_pos + false_pos + false_neg
+    valid = denom > 0
+    if not valid.any():
+        return 0.0
+    iou = true_pos[valid] / (denom[valid] + eps)
+    return float(iou.mean().item())
+
+
+def train_one_epoch_segmentation(
+    model: VGG11UNet,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    device: torch.device,
+    log_interval: int,
+    num_classes: int,
+):
+    model.train()
+    model.encoder.eval()  # keep frozen encoder BN/dropout behavior fixed
+    running_loss = 0.0
+    total_samples = 0
+    pixel_correct = 0
+    total_pixels = 0
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64)
+    start_time = time.perf_counter()
+
+    for batch_idx, (images, masks) in enumerate(loader, start=1):
+        images = images.to(device, non_blocking=device.type == "cuda")
+        masks = masks.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = criterion(logits, masks)
+        loss.backward()
+        optimizer.step()
+
+        preds = torch.argmax(logits, dim=1)
+        batch_size = images.size(0)
+        running_loss += loss.item() * batch_size
+        total_samples += batch_size
+        pixel_correct += (preds == masks).sum().item()
+        total_pixels += masks.numel()
+        _update_segmentation_confusion(confusion, preds, masks, num_classes)
+
+        if log_interval > 0 and batch_idx % log_interval == 0:
+            elapsed = time.perf_counter() - start_time
+            samples_per_sec = total_samples / max(1e-6, elapsed)
+            avg_loss = running_loss / max(1, total_samples)
+            pixel_acc = pixel_correct / max(1, total_pixels)
+            mean_iou = _mean_iou_from_confusion(confusion)
+            print(
+                f"  batch {batch_idx}/{len(loader)} "
+                f"- loss: {avg_loss:.4f} pix_acc: {pixel_acc:.4f} "
+                f"miou: {mean_iou:.4f} "
+                f"({samples_per_sec:.1f} samples/s)"
+            )
+
+    avg_loss = running_loss / max(1, total_samples)
+    pixel_acc = pixel_correct / max(1, total_pixels)
+    mean_iou = _mean_iou_from_confusion(confusion)
+    return avg_loss, pixel_acc, mean_iou
+
+
+def evaluate_segmentation(
+    model: VGG11UNet,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    num_classes: int,
+):
+    model.eval()
+    running_loss = 0.0
+    total_samples = 0
+    pixel_correct = 0
+    total_pixels = 0
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64)
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device, non_blocking=device.type == "cuda")
+            masks = masks.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
+
+            logits = model(images)
+            loss = criterion(logits, masks)
+            preds = torch.argmax(logits, dim=1)
+
+            batch_size = images.size(0)
+            running_loss += loss.item() * batch_size
+            total_samples += batch_size
+            pixel_correct += (preds == masks).sum().item()
+            total_pixels += masks.numel()
+            _update_segmentation_confusion(confusion, preds, masks, num_classes)
+
+    avg_loss = running_loss / max(1, total_samples)
+    pixel_acc = pixel_correct / max(1, total_pixels)
+    mean_iou = _mean_iou_from_confusion(confusion)
+    return avg_loss, pixel_acc, mean_iou
+
+
+def _extract_state_dict(checkpoint) -> dict:
+    if isinstance(checkpoint, dict):
+        if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+            return checkpoint["state_dict"]
+        if "model_state_dict" in checkpoint and isinstance(
+            checkpoint["model_state_dict"], dict
+        ):
+            return checkpoint["model_state_dict"]
+        if all(isinstance(key, str) for key in checkpoint.keys()):
+            return checkpoint
+    raise ValueError("Unsupported checkpoint format; expected a state_dict-like mapping.")
+
+
+def _strip_module_prefix(state_dict: dict) -> dict:
+    if not any(key.startswith("module.") for key in state_dict):
+        return state_dict
+    return {key.replace("module.", "", 1): value for key, value in state_dict.items()}
+
+
+def load_and_freeze_encoder_from_classifier(
+    model: VGG11UNet,
+    classifier_path: str,
+) -> None:
+    if not os.path.isfile(classifier_path):
+        raise FileNotFoundError(f"Classifier checkpoint not found: {classifier_path}")
+
+    checkpoint = torch.load(classifier_path, map_location="cpu")
+    state_dict = _strip_module_prefix(_extract_state_dict(checkpoint))
+    encoder_state = {
+        key: value for key, value in state_dict.items() if key.startswith("encoder.")
+    }
+    if not encoder_state:
+        raise ValueError(
+            "No encoder.* keys found in classifier checkpoint; cannot initialize UNet encoder."
+        )
+
+    incompatible = model.load_state_dict(encoder_state, strict=False)
+    for param in model.encoder.parameters():
+        param.requires_grad = False
+    model.encoder.eval()
+
+    print(
+        f"Loaded {len(encoder_state)} encoder tensors from {classifier_path} "
+        f"and froze encoder parameters."
+    )
+    if incompatible.unexpected_keys:
+        print(f"Unexpected keys while loading encoder: {incompatible.unexpected_keys}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--task",
+        type=str,
+        choices=("classification", "segmentation"),
+        default="classification",
+        help="Task to train.",
+    )
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
@@ -551,6 +819,18 @@ def parse_args():
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--save_path", type=str, default="classifier.pth")
+    parser.add_argument(
+        "--classifier_path",
+        type=str,
+        default="classifier.pth",
+        help="Classifier checkpoint for encoder initialization in segmentation mode.",
+    )
+    parser.add_argument(
+        "--seg_num_classes",
+        type=int,
+        default=3,
+        help="Number of segmentation classes.",
+    )
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument(
         "--disable_aug",
@@ -617,10 +897,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+def run_classification_training(args, device: torch.device):
     ran_visuals = False
     if args.aug_vis > 0:
         visualize_augmentations(
@@ -665,6 +942,7 @@ def main():
     )
     initialize_model_weights(model)
     model = model.to(device)
+
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
             model.parameters(),
@@ -677,6 +955,7 @@ def main():
             lr=args.lr,
             weight_decay=args.weight_decay,
         )
+
     scheduler = None
     if args.lr_scheduler == "cosine":
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -691,11 +970,11 @@ def main():
             factor=args.lr_factor,
             patience=args.lr_patience,
         )
-    criterion = nn.CrossEntropyLoss()
 
+    criterion = nn.CrossEntropyLoss()
     best_acc = -1.0
     print(f"Using device: {device}")
-    print("Starting training...")
+    print("Starting classification training...")
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = train_one_epoch(
             model,
@@ -736,6 +1015,119 @@ def main():
 
     if args.save_path:
         print(f"Best checkpoint saved to {args.save_path} (val acc: {best_acc:.4f})")
+
+
+def run_segmentation_training(args, device: torch.device):
+    if args.save_path == "classifier.pth":
+        args.save_path = "unet.pth"
+
+    train_loader, val_loader = build_segmentation_dataloaders(
+        root=args.data_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        val_ratio=args.val_ratio,
+        overfit_subset=args.overfit_subset,
+    )
+    print(
+        f"Train size: {len(train_loader.dataset)} | "
+        f"Val size: {len(val_loader.dataset)} | "
+        f"Batches per epoch: {len(train_loader)}"
+    )
+
+    model = VGG11UNet(num_classes=args.seg_num_classes)
+    model.apply(_init_classifier_weights)
+    load_and_freeze_encoder_from_classifier(model, args.classifier_path)
+    model = model.to(device)
+
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise RuntimeError("No trainable parameters found for segmentation training.")
+
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            trainable_params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+    scheduler = None
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr,
+        )
+    elif args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+        )
+
+    criterion = nn.CrossEntropyLoss()
+    best_miou = -1.0
+    print(f"Using device: {device}")
+    print("Starting segmentation training...")
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_pix_acc, train_miou = train_one_epoch_segmentation(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            log_interval=args.log_interval,
+            num_classes=args.seg_num_classes,
+        )
+        val_loss, val_pix_acc, val_miou = evaluate_segmentation(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
+            num_classes=args.seg_num_classes,
+        )
+
+        if scheduler is not None:
+            if args.lr_scheduler == "plateau":
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        print(
+            f"Epoch {epoch}/{args.epochs} "
+            f"- train: {train_loss:.4f} pix_acc: {train_pix_acc:.4f} miou: {train_miou:.4f} "
+            f"- val: {val_loss:.4f} pix_acc: {val_pix_acc:.4f} miou: {val_miou:.4f} "
+            f"- lr: {current_lr:.2e}"
+        )
+
+        if val_miou > best_miou:
+            best_miou = val_miou
+            if args.save_path:
+                save_dir = os.path.dirname(args.save_path)
+                if save_dir:
+                    os.makedirs(save_dir, exist_ok=True)
+                torch.save(model.state_dict(), args.save_path)
+
+    if args.save_path:
+        print(f"Best checkpoint saved to {args.save_path} (val mIoU: {best_miou:.4f})")
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.task == "segmentation":
+        run_segmentation_training(args, device)
+        return
+
+    run_classification_training(args, device)
 
 
 if __name__ == "__main__":
