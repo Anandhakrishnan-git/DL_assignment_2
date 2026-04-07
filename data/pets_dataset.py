@@ -1,5 +1,4 @@
-"""Dataset loader for Oxford-IIIT Pet.
-"""
+"""Dataset loader for Oxford-IIIT Pet."""
 
 import os
 import numpy as np
@@ -51,6 +50,29 @@ class OxfordIIITPetDataset(Dataset):
 
         # Load metadata
         self.samples = self._load_annotations()
+
+    @staticmethod
+    def colorize_segmentation_mask(mask: np.ndarray) -> np.ndarray:
+        """Map class ids (0,1,2) to RGB colors for quick visualization."""
+        palette = np.array(
+            [
+                [0, 0, 0],        # class 0: background
+                [0, 255, 0],      # class 1: pet
+                [255, 0, 0],      # class 2: boundary
+            ],
+            dtype=np.uint8,
+        )
+        mask_clipped = np.clip(mask, 0, len(palette) - 1).astype(np.int64)
+        return palette[mask_clipped]
+
+    def get_segmentation_visualization(self, idx: int):
+        """Return raw image, raw mask, colorized mask, and overlay for sample `idx`."""
+        sample = self.samples[idx]
+        image = np.array(Image.open(sample["img_path"]).convert("RGB"), dtype=np.uint8)
+        mask = np.array(Image.open(sample["mask_path"]), dtype=np.int64) - 1
+        color_mask = self.colorize_segmentation_mask(mask)
+        overlay = (0.65 * image + 0.35 * color_mask).astype(np.uint8)
+        return image, mask, color_mask, overlay
 
     def _load_annotations(self):
         samples = []
@@ -117,7 +139,21 @@ class OxfordIIITPetDataset(Dataset):
 
 
 if __name__ == "__main__":
-    dataset = OxfordIIITPetDataset(root="data", split="test", tasks=("category", "segmentation"))
+    dataset = OxfordIIITPetDataset(
+        root="data",
+        split="test",
+        tasks=("category", "segmentation"),
+    )
     print(f"Dataset size: {len(dataset)}")
     img, target = dataset[0]
     print(f"Image size: {img.size}, Target keys: {list(target.keys())}")
+    print(f"Segmentation mask unique labels: {np.unique(target['segmentation'])}")
+
+    image, mask, color_mask, overlay = dataset.get_segmentation_visualization(10)
+    Image.fromarray(image).save("seg_sample_image.png")
+    Image.fromarray(color_mask).save("seg_sample_mask_color.png")
+    Image.fromarray(overlay).save("seg_sample_overlay.png")
+    print("Saved visualization files:")
+    print("  seg_sample_image.png")
+    print("  seg_sample_mask_color.png")
+    print("  seg_sample_overlay.png")
