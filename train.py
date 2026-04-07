@@ -8,6 +8,7 @@ from typing import Tuple
 
 import numpy as np
 from PIL import Image
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset, random_split
@@ -41,25 +42,20 @@ class AlbumentationsTransform:
                 [
                     rrc,
                     A.HorizontalFlip(p=0.5),
+
                     A.Affine(
                         translate_percent=(-0.05, 0.05),
-                        scale=(0.9, 1.1),
-                        rotate=(-15, 15),
-                        border_mode=0,
-                        fill=0,
-                        p=0.5,
+                        scale=(0.95, 1.05),
+                        rotate=(-10, 10),
+                        p=0.3,
                     ),
-                    A.Perspective(
-                        scale=(0.02, 0.05),
-                        keep_size=True,
-                        p=0.2,
-                    ),
+
                     A.ColorJitter(
-                        brightness=0.2,
-                        contrast=0.2,
-                        saturation=0.2,
-                        hue=0.1,
-                        p=0.5,
+                        brightness=0.1,
+                        contrast=0.1,
+                        saturation=0.1,
+                        hue=0.05,
+                        p=0.3,
                     ),
                     A.ColorJitter(
                         brightness=0.3,
@@ -68,8 +64,8 @@ class AlbumentationsTransform:
                         hue=0.1,
                         p=0.4,
                     ),
-                    A.RandomGamma(gamma_limit=(80, 120), p=0.2),
-                    A.GaussianBlur(blur_limit=(3, 5), p=0.1),
+                    #A.RandomGamma(gamma_limit=(80, 120), p=0.2),
+                    #A.GaussianBlur(blur_limit=(3, 5), p=0.1),
                     A.CoarseDropout(
                         num_holes_range=(1, 8),
                         hole_height_range=(0.04, 0.1),
@@ -203,6 +199,132 @@ def _grad_norm_l2(model: nn.Module) -> float:
         param_norm = param.grad.detach().norm(2).item()
         total += param_norm * param_norm
     return total**0.5
+
+
+def _unnormalize_image(
+    tensor: torch.Tensor,
+    mean: Tuple[float, float, float] = IMAGENET_MEAN,
+    std: Tuple[float, float, float] = IMAGENET_STD,
+):
+    """Convert a normalized CHW tensor to a displayable HWC numpy image."""
+    img = tensor.detach().cpu().float().permute(1, 2, 0).numpy()
+    img = img * np.array(std, dtype=np.float32) + np.array(mean, dtype=np.float32)
+    return np.clip(img, 0.0, 1.0)
+
+
+def visualize_augmentations(
+    root: str,
+    num_images: int = 8,
+    seed: int = 42,
+    save_path: str = "augmented_samples.png",
+    show: bool = False,
+):
+    """Visualize a few augmented samples from the training pipeline."""
+    rng = np.random.default_rng(seed)
+    transform = AlbumentationsTransform(train=True)
+    dataset = OxfordIIITPetDataset(
+        root=root,
+        split="trainval",
+        tasks=("category",),
+        transform=transform,
+    )
+
+    num_images = max(1, min(num_images, len(dataset)))
+    indices = rng.choice(len(dataset), size=num_images, replace=False)
+
+    cols = min(4, num_images)
+    rows = int(np.ceil(num_images / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows))
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = np.array([axes])
+    elif cols == 1:
+        axes = axes.reshape(rows, 1)
+
+    for idx, sample_idx in enumerate(indices):
+        image, label = dataset[int(sample_idx)]
+        img = _unnormalize_image(image)
+        r, c = divmod(idx, cols)
+        ax = axes[r, c]
+        ax.imshow(img)
+        ax.set_title(f"label: {label}")
+        ax.axis("off")
+
+    # Hide any unused subplots.
+    for idx in range(num_images, rows * cols):
+        r, c = divmod(idx, cols)
+        axes[r, c].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    print(f"Saved augmentation preview to {save_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def visualize_augmentation_variants(
+    root: str,
+    num_variants: int = 8,
+    image_index: int = -1,
+    seed: int = 42,
+    save_path: str = "augmented_variants.png",
+    show: bool = False,
+):
+    """Visualize multiple augmented variants of the same image."""
+    rng = np.random.default_rng(seed)
+    base_dataset = OxfordIIITPetDataset(
+        root=root,
+        split="trainval",
+        tasks=("category",),
+        transform=None,
+    )
+    if len(base_dataset) == 0:
+        print("Dataset is empty; skipping augmentation variant visualization.")
+        return
+
+    if image_index < 0 or image_index >= len(base_dataset):
+        image_index = int(rng.integers(len(base_dataset)))
+
+    base_image, label = base_dataset[image_index]
+    base_transform = AlbumentationsTransform(train=False)
+    aug_transform = AlbumentationsTransform(train=True)
+
+    variants = [base_transform(base_image)]
+    for _ in range(max(1, num_variants)):
+        variants.append(aug_transform(base_image))
+
+    total = len(variants)
+    cols = min(4, total)
+    rows = int(np.ceil(total / cols))
+    fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows))
+    if rows == 1 and cols == 1:
+        axes = np.array([[axes]])
+    elif rows == 1:
+        axes = np.array([axes])
+    elif cols == 1:
+        axes = axes.reshape(rows, 1)
+
+    for idx, tensor in enumerate(variants):
+        img = _unnormalize_image(tensor)
+        r, c = divmod(idx, cols)
+        ax = axes[r, c]
+        title = "base" if idx == 0 else f"aug {idx}"
+        ax.imshow(img)
+        ax.set_title(f"{title} | label: {label}")
+        ax.axis("off")
+
+    for idx in range(total, rows * cols):
+        r, c = divmod(idx, cols)
+        axes[r, c].axis("off")
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    print(f"Saved augmentation variants to {save_path}")
+    if show:
+        plt.show()
+    plt.close(fig)
 
 
 def _rand_bbox(size, lam: float):
@@ -431,12 +553,75 @@ def parse_args():
         default=3,
         help="Number of initial batches to print debug stats for.",
     )
+    parser.add_argument(
+        "--aug_vis",
+        type=int,
+        default=0,
+        help="Number of augmented samples to visualize (0 disables).",
+    )
+    parser.add_argument(
+        "--aug_vis_path",
+        type=str,
+        default="augmented_samples.png",
+        help="Path to save the augmentation visualization grid.",
+    )
+    parser.add_argument(
+        "--aug_vis_show",
+        action="store_true",
+        help="Display the augmentation grid interactively.",
+    )
+    parser.add_argument(
+        "--aug_vis_only",
+        action="store_true",
+        help="Only generate augmentation visualization and exit.",
+    )
+    parser.add_argument(
+        "--aug_vis_variants",
+        type=int,
+        default=0,
+        help="Number of augmented variants of a single image to visualize (0 disables).",
+    )
+    parser.add_argument(
+        "--aug_vis_variants_path",
+        type=str,
+        default="augmented_variants.png",
+        help="Path to save the single-image augmentation grid.",
+    )
+    parser.add_argument(
+        "--aug_vis_index",
+        type=int,
+        default=-1,
+        help="Image index for variant visualization (-1 picks random).",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ran_visuals = False
+    if args.aug_vis > 0:
+        visualize_augmentations(
+            root=args.data_root,
+            num_images=args.aug_vis,
+            save_path=args.aug_vis_path,
+            show=args.aug_vis_show,
+        )
+        ran_visuals = True
+
+    if args.aug_vis_variants > 0:
+        visualize_augmentation_variants(
+            root=args.data_root,
+            num_variants=args.aug_vis_variants,
+            image_index=args.aug_vis_index,
+            save_path=args.aug_vis_variants_path,
+            show=args.aug_vis_show,
+        )
+        ran_visuals = True
+
+    if args.aug_vis_only and ran_visuals:
+        return
 
     train_loader, val_loader = build_dataloaders(
         root=args.data_root,
@@ -454,7 +639,7 @@ def main():
 
     model = VGG11Classifier(
         num_classes=37,
-        dropout_p=0.6,
+        dropout_p=0.5,
         dropout_mode=args.dropout_mode,
     ).to(device)
     if args.optimizer == "adamw":
