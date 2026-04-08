@@ -16,7 +16,8 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from data.pets_dataset import OxfordIIITPetDataset
-from models import VGG11Classifier, VGG11UNet
+from losses import IoULoss
+from models import VGG11Classifier, VGG11UNet, VGG11Localizer
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -200,6 +201,26 @@ class SegmentationTargetTransform:
         return out
 
 
+class LocalizationTargetTransform:
+    """Convert bbox targets to float tensors in IMAGE_SIZE pixel coordinates."""
+
+    def __init__(self, size: int = IMAGE_SIZE):
+        self.size = float(size)
+
+    def __call__(self, targets):
+        out = dict(targets)
+        if "localization" in out:
+            bbox = np.asarray(out["localization"], dtype=np.float32).reshape(4)
+
+            # Dataset stores normalized xywh in [0, 1]; convert to pixel space.
+            # This keeps training targets aligned with model outputs in pixels.
+            if float(np.max(np.abs(bbox))) <= 1.5:
+                bbox = bbox * self.size
+
+            out["localization"] = torch.tensor(bbox, dtype=torch.float32)
+        return out
+
+
 def build_segmentation_dataloaders(
     root: str,
     batch_size: int,
@@ -256,6 +277,77 @@ def build_segmentation_dataloaders(
     # Keep pin_memory off for segmentation on Windows/CUDA to avoid
     # intermittent "cudaErrorAlreadyMapped" from DataLoader pin threads.
     pin_memory = False
+    train_loader = DataLoader(
+        train_set,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+    return train_loader, val_loader
+
+
+def build_localization_dataloaders(
+    root: str,
+    batch_size: int,
+    num_workers: int,
+    val_ratio: float,
+    overfit_subset: int = 0,
+):
+    """Build localization dataloaders with aligned image/bbox resizing."""
+    base_set = OxfordIIITPetDataset(
+        root=root,
+        split="trainval",
+        tasks=("localization",),
+        transform=None,
+        target_transform=None,
+    )
+    val_size = int(len(base_set) * val_ratio)
+    train_size = len(base_set) - val_size
+    generator = torch.Generator().manual_seed(42)
+    train_split, val_split = random_split(base_set, [train_size, val_size], generator=generator)
+
+    train_indices = list(train_split.indices)
+    val_indices = list(val_split.indices)
+
+    if overfit_subset > 0:
+        subset_size = min(overfit_subset, len(train_indices))
+        subset_indices = train_indices[:subset_size]
+        train_indices = subset_indices
+        val_indices = subset_indices
+
+    image_transform = AlbumentationsTransform(train=False)
+    target_transform = LocalizationTargetTransform(size=IMAGE_SIZE)
+
+    train_set = Subset(
+        OxfordIIITPetDataset(
+            root=root,
+            split="trainval",
+            tasks=("localization",),
+            transform=image_transform,
+            target_transform=target_transform,
+        ),
+        train_indices,
+    )
+    val_set = Subset(
+        OxfordIIITPetDataset(
+            root=root,
+            split="trainval",
+            tasks=("localization",),
+            transform=image_transform,
+            target_transform=target_transform,
+        ),
+        val_indices,
+    )
+
+    pin_memory = torch.cuda.is_available()
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -696,6 +788,94 @@ def evaluate_segmentation(
     return avg_loss, pixel_acc, mean_iou
 
 
+class LocalizationRegressionLoss(nn.Module):
+    """Combined localization loss: MSE + IoU."""
+
+    def __init__(
+        self,
+        mse_weight: float = 1.0,
+        iou_weight: float = 1.0,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        self.mse_weight = float(mse_weight)
+        self.iou_weight = float(iou_weight)
+        self.mse = nn.MSELoss(reduction=reduction)
+        self.iou = IoULoss(reduction=reduction)
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        return self.mse_weight * self.mse(preds, targets) + self.iou_weight * self.iou(
+            preds, targets
+        )
+
+
+def train_one_epoch_localization(
+    model,
+    loader,
+    optimizer,
+    criterion,
+    device: torch.device,
+    log_interval: int,
+):
+    model.train()
+    running_loss = 0.0
+    total_samples = 0
+    start_time = time.perf_counter()
+
+    for batch_idx, (images, bboxes) in enumerate(loader, start=1):
+        images = images.to(device, non_blocking=device.type == "cuda")
+        bboxes = bboxes.to(device, dtype=torch.float32, non_blocking=device.type == "cuda")
+
+        optimizer.zero_grad(set_to_none=True)
+        preds = model(images)
+        loss = criterion(preds, bboxes)
+        loss.backward()
+        optimizer.step()
+
+        batch_size = images.size(0)
+        running_loss += loss.item() * batch_size
+        total_samples += batch_size
+
+        if log_interval > 0 and batch_idx % log_interval == 0:
+            elapsed = time.perf_counter() - start_time
+            samples_per_sec = total_samples / max(1e-6, elapsed)
+            avg_loss = running_loss / max(1, total_samples)
+            print(
+                f"  batch {batch_idx}/{len(loader)} "
+                f"- loss: {avg_loss:.4f} "
+                f"({samples_per_sec:.1f} samples/s)"
+            )
+
+    avg_loss = running_loss / max(1, total_samples)
+    return avg_loss
+
+
+def evaluate_localization(
+    model,
+    loader,
+    criterion,
+    device: torch.device,
+):
+    model.eval()
+    running_loss = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for images, bboxes in loader:
+            images = images.to(device, non_blocking=device.type == "cuda")
+            bboxes = bboxes.to(device, dtype=torch.float32, non_blocking=device.type == "cuda")
+
+            preds = model(images)
+            loss = criterion(preds, bboxes)
+
+            batch_size = images.size(0)
+            running_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+    avg_loss = running_loss / max(1, total_samples)
+    return avg_loss
+
+
 def _extract_state_dict(checkpoint) -> dict:
     if isinstance(checkpoint, dict):
         if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
@@ -750,7 +930,7 @@ def parse_args():
     parser.add_argument(
         "--task",
         type=str,
-        choices=("classification", "segmentation"),
+        choices=("classification", "segmentation", "localization"),
         default="classification",
         help="Task to train.",
     )
@@ -830,6 +1010,18 @@ def parse_args():
         type=int,
         default=3,
         help="Number of segmentation classes.",
+    )
+    parser.add_argument(
+        "--loc_mse_weight",
+        type=float,
+        default=1.0,
+        help="Weight for localization MSE term.",
+    )
+    parser.add_argument(
+        "--loc_iou_weight",
+        type=float,
+        default=1.0,
+        help="Weight for localization IoU term.",
     )
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument(
@@ -1119,12 +1311,113 @@ def run_segmentation_training(args, device: torch.device):
         print(f"Best checkpoint saved to {args.save_path} (val mIoU: {best_miou:.4f})")
 
 
+def run_localization_training(args, device: torch.device):
+    if args.save_path == "classifier.pth":
+        args.save_path = "localizer.pth"
+
+    train_loader, val_loader = build_localization_dataloaders(
+        root=args.data_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        val_ratio=args.val_ratio,
+        overfit_subset=args.overfit_subset,
+    )
+    print(
+        f"Train size: {len(train_loader.dataset)} | "
+        f"Val size: {len(val_loader.dataset)} | "
+        f"Batches per epoch: {len(train_loader)}"
+    )
+
+    model = VGG11Localizer()
+    model.apply(_init_classifier_weights)
+    model = model.to(device)
+
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+    scheduler = None
+    if args.lr_scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=args.epochs,
+            eta_min=args.min_lr,
+        )
+    elif args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=args.lr_factor,
+            patience=args.lr_patience,
+        )
+
+    criterion = LocalizationRegressionLoss(
+        mse_weight=args.loc_mse_weight,
+        iou_weight=args.loc_iou_weight,
+    )
+    best_loss = float('inf')
+    print(f"Using device: {device}")
+    print("Starting localization training...")
+    for epoch in range(1, args.epochs + 1):
+        train_loss = train_one_epoch_localization(
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            log_interval=args.log_interval,
+        )
+        val_loss = evaluate_localization(
+            model=model,
+            loader=val_loader,
+            criterion=criterion,
+            device=device,
+        )
+
+        if scheduler is not None:
+            if args.lr_scheduler == "plateau":
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        print(
+            f"Epoch {epoch}/{args.epochs} "
+            f"- train: {train_loss:.4f} "
+            f"- val: {val_loss:.4f} "
+            f"- lr: {current_lr:.2e}"
+        )
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            if args.save_path:
+                save_dir = os.path.dirname(args.save_path)
+                if save_dir:
+                    os.makedirs(save_dir, exist_ok=True)
+                torch.save(model.state_dict(), args.save_path)
+
+    if args.save_path:
+        print(f"Best checkpoint saved to {args.save_path} (val loss: {best_loss:.4f})")
+
+
 def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if args.task == "segmentation":
         run_segmentation_training(args, device)
+        return
+    elif args.task == "localization":
+        run_localization_training(args, device)
         return
 
     run_classification_training(args, device)
