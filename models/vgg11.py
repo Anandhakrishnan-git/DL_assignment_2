@@ -3,7 +3,6 @@
 
 from typing import Dict, Tuple, Union
 
-from .layers import CustomDropout
 import torch
 import torch.nn as nn
 
@@ -45,7 +44,6 @@ class VGG11Encoder(nn.Module):
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            CustomDropout(p=0.2, mode="spatial"),  # Add dropout after conv blocks to help regularization
         ]
         block_5 = [
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
@@ -55,7 +53,6 @@ class VGG11Encoder(nn.Module):
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            CustomDropout(p=0.2, mode="spatial"),  # Add dropout after conv blocks to help regularization
         ]
         self.encoder = nn.Sequential(
             *block_1,

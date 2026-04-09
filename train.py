@@ -20,10 +20,19 @@ from data.pets_dataset import OxfordIIITPetDataset
 from losses import IoULoss
 from models import VGG11Classifier, VGG11UNet, VGG11Localizer
 
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+
+# ============================================================================
+# AUGMENTATION: Image transformation with train/eval modes
+# ============================================================================
 
 class AlbumentationsTransform:
     def __init__(
@@ -112,6 +121,11 @@ def _build_random_resized_crop(
         )
     return A.RandomResizedCrop(size, size, scale=scale, ratio=ratio, p=p)
 
+
+# ============================================================================
+# ADDITIONAL TRANSFORMS: Target-specific transformations
+# ============================================================================
+
 class SegmentationTargetTransform:
     """Convert segmentation masks to resized LongTensor targets."""
 
@@ -150,12 +164,16 @@ class LocalizationTargetTransform:
             out["localization"] = torch.tensor(bbox, dtype=torch.float32)
         return out
 
+
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+
 def build_dataloaders(
     task: str,
     root: str,
     batch_size: int,
     num_workers: int,
-    overfit_subset: int = 0,
     use_augmentation: bool = True,
 ):
     if task == "classification":
@@ -194,13 +212,6 @@ def build_dataloaders(
         target_transform=target_transform,
     )
 
-    if overfit_subset > 0:
-        subset_size = min(overfit_subset, len(train_set))
-        train_indices = list(range(subset_size))
-        val_indices = list(range(subset_size))
-        train_set = Subset(train_set, train_indices)
-        val_set = Subset(val_set, val_indices)
-
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -218,23 +229,18 @@ def build_dataloaders(
     return train_loader, val_loader
 
 
-
-
+# ============================================================================
+# METRICS & UTILITIES
+# ============================================================================
 
 def _accuracy(logits: torch.Tensor, targets: torch.Tensor) -> int:
     preds = torch.argmax(logits, dim=1)
     return (preds == targets).sum().item()
 
 
-def _grad_norm_l2(model: nn.Module) -> float:
-    total = 0.0
-    for param in model.parameters():
-        if param.grad is None:
-            continue
-        param_norm = param.grad.detach().norm(2).item()
-        total += param_norm * param_norm
-    return total**0.5
-
+# ============================================================================
+# CUTMIX/MIXUP: Data augmentation utilities
+# ============================================================================
 
 def _rand_bbox(size, lam: float):
     """Generate CutMix bounding box."""
@@ -254,6 +260,10 @@ def _rand_bbox(size, lam: float):
     return bbx1, bby1, bbx2, bby2
 
 
+# ============================================================================
+# TRAINING LOOP
+# ============================================================================
+
 def train_one_epoch(
     task: str,
     model,
@@ -266,8 +276,6 @@ def train_one_epoch(
     mixup_alpha: float = 0.0,
     cutmix_alpha: float = 0.0,
     mix_prob: float = 1.0,
-    debug_stats: bool = False,
-    debug_batches: int = 0,
 ):
     model.train()
     running_loss = 0.0
@@ -334,11 +342,6 @@ def train_one_epoch(
                 loss = criterion(logits, targets)
 
         loss.backward()
-
-        if debug_stats and batch_idx <= debug_batches:
-            grad_norm = _grad_norm_l2(model)
-            print(f"  debug batch {batch_idx} - grad_norm: {grad_norm:.6f}")
-
         optimizer.step()
 
         batch_size = images.size(0)
@@ -438,6 +441,43 @@ def _mean_iou_from_confusion(confusion: torch.Tensor, eps: float = 1e-6) -> floa
     return float(iou.mean().item())
 
 
+# ============================================================================
+# LOCALIZATION LOSS
+# ============================================================================
+
+class LocalizationRegressionLoss(nn.Module):
+    """Combined localization loss: MSE + IoU weighted sum."""
+
+    def __init__(self, mse_weight: float = 1.0, iou_weight: float = 1.0):
+        """
+        Initialize the LocalizationRegressionLoss.
+
+        Args:
+            mse_weight: Weight for MSE loss component.
+            iou_weight: Weight for IoU loss component.
+        """
+        super().__init__()
+        self.mse_weight = float(mse_weight)
+        self.iou_weight = float(iou_weight)
+        self.mse = nn.MSELoss()
+        self.iou = IoULoss()
+
+    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass combining MSE and IoU losses.
+
+        Args:
+            preds: Predicted bounding boxes [B, 4] in pixel coordinates (xywh).
+            targets: Target bounding boxes [B, 4] in pixel coordinates (xywh).
+
+        Returns:
+            Combined loss value.
+        """
+        mse_loss = self.mse(preds, targets)
+        iou_loss = self.iou(preds, targets)
+        return self.mse_weight * mse_loss + self.iou_weight * iou_loss
+
+
 def evaluate_segmentation(
     model: VGG11UNet,
     loader: DataLoader,
@@ -473,26 +513,6 @@ def evaluate_segmentation(
     mean_iou = _mean_iou_from_confusion(confusion)
     return avg_loss, pixel_acc, mean_iou
 
-
-class LocalizationRegressionLoss(nn.Module):
-    """Combined localization loss: MSE + IoU."""
-
-    def __init__(
-        self,
-        mse_weight: float = 1.0,
-        iou_weight: float = 1.0,
-        reduction: str = "mean",
-    ):
-        super().__init__()
-        self.mse_weight = float(mse_weight)
-        self.iou_weight = float(iou_weight)
-        self.mse = nn.MSELoss(reduction=reduction)
-        self.iou = IoULoss(reduction=reduction)
-
-    def forward(self, preds: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        return self.mse_weight * self.mse(preds, targets) + self.iou_weight * self.iou(
-            preds, targets
-        )
 
 
 def evaluate_localization(
@@ -572,124 +592,26 @@ def load_and_freeze_encoder_from_classifier(
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--task",
-        type=str,
-        choices=("classification", "segmentation", "localization"),
-        default="classification",
-        help="Task to train.",
-    )
+    parser.add_argument("--task",type=str,choices=("classification", "segmentation", "localization"),default="classification",help="Task to train.",)
     parser.add_argument("--data_root", type=str, default="data")
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument(
-        "--optimizer",
-        type=str,
-        choices=("adam", "adamw"),
-        default="adamw",
-        help="Optimizer type.",
-    )
-    parser.add_argument(
-        "--lr_scheduler",
-        type=str,
-        choices=("none", "cosine", "plateau"),
-        default="cosine",
-        help="Learning rate scheduler.",
-    )
-    parser.add_argument(
-        "--min_lr",
-        type=float,
-        default=1e-6,
-        help="Minimum LR for cosine schedule.",
-    )
-    parser.add_argument(
-        "--lr_patience",
-        type=int,
-        default=3,
-        help="Plateau scheduler patience (epochs).",
-    )
-    parser.add_argument(
-        "--lr_factor",
-        type=float,
-        default=0.5,
-        help="Plateau scheduler decay factor.",
-    )
-    parser.add_argument(
-        "--mixup_alpha",
-        type=float,
-        default=0.0,
-        help="MixUp alpha (0 disables).",
-    )
-    parser.add_argument(
-        "--cutmix_alpha",
-        type=float,
-        default=0.0,
-        help="CutMix alpha (0 disables).",
-    )
-    parser.add_argument(
-        "--mix_prob",
-        type=float,
-        default=1.0,
-        help="Probability to apply MixUp/CutMix per batch.",
-    )
-    parser.add_argument(
-        "--dropout_mode",
-        type=str,
-        choices=("element", "channel", "spatial"),
-        default="channel",
-        help="CustomDropout mode for the classifier head.",
-    )
+    parser.add_argument("--optimizer",type=str,choices=("adam", "adamw"),default="adamw",help="Optimizer type.",)
+    parser.add_argument("--lr_scheduler",type=str,choices=("none", "cosine", "plateau"),default="cosine",help="Learning rate scheduler.",)
+    parser.add_argument("--min_lr",type=float,default=1e-6,help="Minimum LR for cosine schedule.",)
+    parser.add_argument("--lr_patience",type=int,default=3,help="Plateau scheduler patience (epochs).",)
+    parser.add_argument("--lr_factor",type=float,default=0.5,help="Plateau scheduler decay factor.",)
+    parser.add_argument("--mixup_alpha",type=float,default=0.0,help="MixUp alpha (0 disables).",)
+    parser.add_argument("--cutmix_alpha",type=float,default=0.0,help="CutMix alpha (0 disables).",)
+    parser.add_argument("--mix_prob",type=float,default=1.0,help="Probability to apply MixUp/CutMix per batch.",)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--save_path", type=str, default="classifier.pth")
-    parser.add_argument(
-        "--classifier_path",
-        type=str,
-        default="classifier.pth",
-        help="Classifier checkpoint for encoder initialization in segmentation mode.",
-    )
-    parser.add_argument(
-        "--seg_num_classes",
-        type=int,
-        default=3,
-        help="Number of segmentation classes.",
-    )
-    parser.add_argument(
-        "--loc_mse_weight",
-        type=float,
-        default=1.0,
-        help="Weight for localization MSE term.",
-    )
-    parser.add_argument(
-        "--loc_iou_weight",
-        type=float,
-        default=1.0,
-        help="Weight for localization IoU term.",
-    )
+    parser.add_argument("--classifier_path",type=str, default="checkpoints/classifier.pth", help="Classifier checkpoint for encoder initialization in segmentation mode.",)
     parser.add_argument("--log_interval", type=int, default=50)
-    parser.add_argument(
-        "--disable_aug",
-        action="store_true",
-        help="Disable training data augmentation.",
-    )
-    parser.add_argument(
-        "--overfit_subset",
-        type=int,
-        default=0,
-        help="If >0, train/val on a tiny subset to sanity-check overfitting.",
-    )
-    parser.add_argument(
-        "--debug_stats",
-        action="store_true",
-        help="Print grad/logit/feature stats for the first few batches.",
-    )
-    parser.add_argument(
-        "--debug_batches",
-        type=int,
-        default=3,
-        help="Number of initial batches to print debug stats for.",
-    )
+    parser.add_argument("--disable_aug",action="store_true",help="Disable training data augmentation.",)
+    parser.add_argument("--iou_w", type=float, default=0.5, help="Weight for IoU loss vs MSE loss in localization training.",)
     return parser.parse_args()
 
 
@@ -699,7 +621,6 @@ def run_classification_training(args, device: torch.device):
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        overfit_subset=args.overfit_subset,
         use_augmentation=not args.disable_aug,
     )
     print(
@@ -711,7 +632,6 @@ def run_classification_training(args, device: torch.device):
     model = VGG11Classifier(
         num_classes=37,
         dropout_p=0.5,
-        dropout_mode=args.dropout_mode,
     )
     model = model.to(device)
 
@@ -759,8 +679,6 @@ def run_classification_training(args, device: torch.device):
             mixup_alpha=args.mixup_alpha,
             cutmix_alpha=args.cutmix_alpha,
             mix_prob=args.mix_prob,
-            debug_stats=args.debug_stats,
-            debug_batches=args.debug_batches,
         )
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
 
@@ -799,7 +717,6 @@ def run_segmentation_training(args, device: torch.device):
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        overfit_subset=args.overfit_subset,
     )
     print(
         f"Train size: {len(train_loader.dataset)} | "
@@ -807,7 +724,7 @@ def run_segmentation_training(args, device: torch.device):
         f"Batches per epoch: {len(train_loader)}"
     )
 
-    model = VGG11UNet(num_classes=args.seg_num_classes)
+    model = VGG11UNet(num_classes=3)
     load_and_freeze_encoder_from_classifier(model, args.classifier_path)
     model = model.to(device)
 
@@ -856,14 +773,14 @@ def run_segmentation_training(args, device: torch.device):
             criterion=criterion,
             device=device,
             log_interval=args.log_interval,
-            num_classes=args.seg_num_classes,
+            num_classes=3,
         )
         val_loss, val_pix_acc, val_miou = evaluate_segmentation(
             model=model,
             loader=val_loader,
             criterion=criterion,
             device=device,
-            num_classes=args.seg_num_classes,
+            num_classes=3,
         )
 
         if scheduler is not None:
@@ -893,15 +810,14 @@ def run_segmentation_training(args, device: torch.device):
 
 
 def run_localization_training(args, device: torch.device):
-    if args.save_path == "classifier.pth":
-        args.save_path = "localizer.pth"
+    if args.save_path == "checkpoints/classifier.pth":
+        args.save_path = "checkpoints/localizer.pth"
 
     train_loader, val_loader = build_dataloaders(
         task="localization",
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        overfit_subset=args.overfit_subset,
     )
     print(
         f"Train size: {len(train_loader.dataset)} | "
@@ -941,8 +857,8 @@ def run_localization_training(args, device: torch.device):
         )
 
     criterion = LocalizationRegressionLoss(
-        mse_weight=args.loc_mse_weight,
-        iou_weight=args.loc_iou_weight,
+        mse_weight=1.0 - args.iou_w,
+        iou_weight=args.iou_w,
     )
     best_loss = float('inf')
     print(f"Using device: {device}")

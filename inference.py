@@ -16,10 +16,19 @@ from data.pets_dataset import OxfordIIITPetDataset
 from models import VGG11Classifier, VGG11UNet, VGG11Localizer
 from losses.iou_loss import IoULoss
 
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
+
+# ============================================================================
+# AUGMENTATION: Image transformation for inference
+# ============================================================================
 
 class AlbumentationsTransform:
     def __init__(
@@ -40,6 +49,10 @@ class AlbumentationsTransform:
         arr = np.asarray(image, dtype=np.uint8)
         return self.transform(image=arr)["image"]
 
+
+# ============================================================================
+# ADDITIONAL TRANSFORMS: Target-specific transformations
+# ============================================================================
 
 class SegmentationTargetTransform:
     """Convert segmentation masks to resized LongTensor targets."""
@@ -76,6 +89,10 @@ class LocalizationTargetTransform:
         return out
 
 
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+
 def build_test_loader(task: str, root: str, batch_size: int, num_workers: int):
     test_transform = AlbumentationsTransform()
     if task == "classification":
@@ -109,6 +126,10 @@ def build_test_loader(task: str, root: str, batch_size: int, num_workers: int):
     )
     return test_loader
 
+
+# ============================================================================
+# METRICS & UTILITIES
+# ============================================================================
 
 def _update_confusion_matrix(
     conf: np.ndarray, targets: np.ndarray, preds: np.ndarray, num_classes: int
@@ -256,6 +277,10 @@ def _colorize_segmentation_mask(mask: np.ndarray, num_classes: int) -> np.ndarra
     return palette[mask_clipped]
 
 
+# ============================================================================
+# SEGMENTATION EVALUATION
+# ============================================================================
+
 def evaluate_segmentation(
     model: nn.Module,
     loader: DataLoader,
@@ -293,6 +318,10 @@ def evaluate_segmentation(
     return avg_loss, metrics["pixel_acc"], metrics
 
 
+# ============================================================================
+# CHECKPOINT UTILITIES
+# ============================================================================
+
 def _extract_state_dict(checkpoint):
     if isinstance(checkpoint, dict):
         if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
@@ -317,6 +346,10 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device
     state_dict = _strip_module_prefix(_extract_state_dict(checkpoint))
     model.load_state_dict(state_dict)
 
+
+# ============================================================================
+# ARGUMENT PARSING & INFERENCE RUNNERS
+# ============================================================================
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -489,6 +522,10 @@ def run_localization_inference(args, device: torch.device):
     print(f"Localization test loss: {avg_loss:.4f}")
 
 
+# ============================================================================
+# LOCALIZATION EVALUATION
+# ============================================================================
+
 def evaluate_localization(
     model: nn.Module,
     loader: DataLoader,
@@ -514,6 +551,10 @@ def evaluate_localization(
     avg_loss = running_loss / max(1, total_samples)
     return avg_loss
 
+
+# ============================================================================
+# MAIN INFERENCE ENTRY POINT
+# ============================================================================
 
 def main():
     args = parse_args()
