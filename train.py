@@ -8,10 +8,11 @@ from typing import Tuple
 
 import numpy as np
 from PIL import Image
-import matplotlib.pyplot as plt
+import os
+import time
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -85,7 +86,6 @@ class AlbumentationsTransform:
         arr = np.asarray(image, dtype=np.uint8)
         return self.transform(image=arr)["image"]
 
-
 def _build_random_resized_crop(
     size: int,
     scale: Tuple[float, float],
@@ -112,75 +112,6 @@ def _build_random_resized_crop(
         )
     return A.RandomResizedCrop(size, size, scale=scale, ratio=ratio, p=p)
 
-
-def build_dataloaders(
-    root: str,
-    batch_size: int,
-    num_workers: int,
-    val_ratio: float,
-    overfit_subset: int = 0,
-    use_augmentation: bool = True,
-):
-    base_set = OxfordIIITPetDataset(
-        root=root,
-        split="trainval",
-        tasks=("category",),
-        transform=None,
-    )
-    val_size = int(len(base_set) * val_ratio)
-    train_size = len(base_set) - val_size
-    generator = torch.Generator().manual_seed(42)
-    train_split, val_split = random_split(base_set, [train_size, val_size], generator=generator)
-
-    train_indices = list(train_split.indices)
-    val_indices = list(val_split.indices)
-
-    if overfit_subset > 0:
-        subset_size = min(overfit_subset, len(train_indices))
-        subset_indices = train_indices[:subset_size]
-        train_indices = subset_indices
-        val_indices = subset_indices
-
-    train_transform = AlbumentationsTransform(train=use_augmentation)
-    val_transform = AlbumentationsTransform(train=False)
-
-    train_set = Subset(
-        OxfordIIITPetDataset(
-            root=root,
-            split="trainval",
-            tasks=("category",),
-            transform=train_transform,
-        ),
-        train_indices,
-    )
-    val_set = Subset(
-        OxfordIIITPetDataset(
-            root=root,
-            split="trainval",
-            tasks=("category",),
-            transform=val_transform,
-        ),
-        val_indices,
-    )
-
-    pin_memory = torch.cuda.is_available()
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    return train_loader, val_loader
-
-
 class SegmentationTargetTransform:
     """Convert segmentation masks to resized LongTensor targets."""
 
@@ -199,7 +130,6 @@ class SegmentationTargetTransform:
             mask_arr = np.array(mask_img, dtype=np.int64, copy=True)
             out["segmentation"] = torch.tensor(mask_arr, dtype=torch.long)
         return out
-
 
 class LocalizationTargetTransform:
     """Convert bbox targets to float tensors in IMAGE_SIZE pixel coordinates."""
@@ -220,63 +150,57 @@ class LocalizationTargetTransform:
             out["localization"] = torch.tensor(bbox, dtype=torch.float32)
         return out
 
-
-def build_segmentation_dataloaders(
+def build_dataloaders(
+    task: str,
     root: str,
     batch_size: int,
     num_workers: int,
-    val_ratio: float,
     overfit_subset: int = 0,
+    use_augmentation: bool = True,
 ):
-    """Build segmentation dataloaders with aligned image/mask resizing."""
-    base_set = OxfordIIITPetDataset(
-        root=root,
-        split="trainval",
-        tasks=("segmentation",),
-        transform=None,
-        target_transform=None,
-    )
-    val_size = int(len(base_set) * val_ratio)
-    train_size = len(base_set) - val_size
-    generator = torch.Generator().manual_seed(42)
-    train_split, val_split = random_split(base_set, [train_size, val_size], generator=generator)
+    if task == "classification":
+        train_transform = AlbumentationsTransform(train=use_augmentation)
+        val_transform = AlbumentationsTransform(train=False)
+        target_transform = None
+        tasks = ("category",)
+        pin_memory = torch.cuda.is_available()
+    elif task == "segmentation":
+        train_transform = AlbumentationsTransform(train=False)
+        val_transform = AlbumentationsTransform(train=False)
+        target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
+        tasks = ("segmentation",)
+        pin_memory = False  # Avoid issues on Windows/CUDA
+    elif task == "localization":
+        train_transform = AlbumentationsTransform(train=False)
+        val_transform = AlbumentationsTransform(train=False)
+        target_transform = LocalizationTargetTransform(size=IMAGE_SIZE)
+        tasks = ("localization",)
+        pin_memory = torch.cuda.is_available()
+    else:
+        raise ValueError(f"Unknown task: {task}")
 
-    train_indices = list(train_split.indices)
-    val_indices = list(val_split.indices)
+    train_set = OxfordIIITPetDataset(
+        root=root,
+        split="train",
+        tasks=tasks,
+        transform=train_transform,
+        target_transform=target_transform,
+    )
+    val_set = OxfordIIITPetDataset(
+        root=root,
+        split="val",
+        tasks=tasks,
+        transform=val_transform,
+        target_transform=target_transform,
+    )
 
     if overfit_subset > 0:
-        subset_size = min(overfit_subset, len(train_indices))
-        subset_indices = train_indices[:subset_size]
-        train_indices = subset_indices
-        val_indices = subset_indices
+        subset_size = min(overfit_subset, len(train_set))
+        train_indices = list(range(subset_size))
+        val_indices = list(range(subset_size))
+        train_set = Subset(train_set, train_indices)
+        val_set = Subset(val_set, val_indices)
 
-    image_transform = AlbumentationsTransform(train=False)
-    target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
-
-    train_set = Subset(
-        OxfordIIITPetDataset(
-            root=root,
-            split="trainval",
-            tasks=("segmentation",),
-            transform=image_transform,
-            target_transform=target_transform,
-        ),
-        train_indices,
-    )
-    val_set = Subset(
-        OxfordIIITPetDataset(
-            root=root,
-            split="trainval",
-            tasks=("segmentation",),
-            transform=image_transform,
-            target_transform=target_transform,
-        ),
-        val_indices,
-    )
-
-    # Keep pin_memory off for segmentation on Windows/CUDA to avoid
-    # intermittent "cudaErrorAlreadyMapped" from DataLoader pin threads.
-    pin_memory = False
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
@@ -294,107 +218,12 @@ def build_segmentation_dataloaders(
     return train_loader, val_loader
 
 
-def build_localization_dataloaders(
-    root: str,
-    batch_size: int,
-    num_workers: int,
-    val_ratio: float,
-    overfit_subset: int = 0,
-):
-    """Build localization dataloaders with aligned image/bbox resizing."""
-    base_set = OxfordIIITPetDataset(
-        root=root,
-        split="trainval",
-        tasks=("localization",),
-        transform=None,
-        target_transform=None,
-    )
-    val_size = int(len(base_set) * val_ratio)
-    train_size = len(base_set) - val_size
-    generator = torch.Generator().manual_seed(42)
-    train_split, val_split = random_split(base_set, [train_size, val_size], generator=generator)
 
-    train_indices = list(train_split.indices)
-    val_indices = list(val_split.indices)
-
-    if overfit_subset > 0:
-        subset_size = min(overfit_subset, len(train_indices))
-        subset_indices = train_indices[:subset_size]
-        train_indices = subset_indices
-        val_indices = subset_indices
-
-    image_transform = AlbumentationsTransform(train=False)
-    target_transform = LocalizationTargetTransform(size=IMAGE_SIZE)
-
-    train_set = Subset(
-        OxfordIIITPetDataset(
-            root=root,
-            split="trainval",
-            tasks=("localization",),
-            transform=image_transform,
-            target_transform=target_transform,
-        ),
-        train_indices,
-    )
-    val_set = Subset(
-        OxfordIIITPetDataset(
-            root=root,
-            split="trainval",
-            tasks=("localization",),
-            transform=image_transform,
-            target_transform=target_transform,
-        ),
-        val_indices,
-    )
-
-    pin_memory = torch.cuda.is_available()
-    train_loader = DataLoader(
-        train_set,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
-    return train_loader, val_loader
 
 
 def _accuracy(logits: torch.Tensor, targets: torch.Tensor) -> int:
     preds = torch.argmax(logits, dim=1)
     return (preds == targets).sum().item()
-
-
-def _init_classifier_weights(module: nn.Module) -> None:
-    """Initialize VGG-style modules for ReLU activations."""
-    if isinstance(module, (nn.Conv2d, nn.ConvTranspose2d)):
-        nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-    elif isinstance(module, nn.Linear):
-        nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="relu")
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-    elif isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-        if module.weight is not None:
-            nn.init.ones_(module.weight)
-        if module.bias is not None:
-            nn.init.zeros_(module.bias)
-
-
-def initialize_model_weights(model: VGG11Classifier) -> None:
-    """Apply custom initialization and soften the logits layer scale."""
-    model.apply(_init_classifier_weights)
-    final_layer = model.classifier[-1]
-    if isinstance(final_layer, nn.Linear):
-        nn.init.normal_(final_layer.weight, mean=0.0, std=0.01)
-        if final_layer.bias is not None:
-            nn.init.zeros_(final_layer.bias)
 
 
 def _grad_norm_l2(model: nn.Module) -> float:
@@ -405,132 +234,6 @@ def _grad_norm_l2(model: nn.Module) -> float:
         param_norm = param.grad.detach().norm(2).item()
         total += param_norm * param_norm
     return total**0.5
-
-
-def _unnormalize_image(
-    tensor: torch.Tensor,
-    mean: Tuple[float, float, float] = IMAGENET_MEAN,
-    std: Tuple[float, float, float] = IMAGENET_STD,
-):
-    """Convert a normalized CHW tensor to a displayable HWC numpy image."""
-    img = tensor.detach().cpu().float().permute(1, 2, 0).numpy()
-    img = img * np.array(std, dtype=np.float32) + np.array(mean, dtype=np.float32)
-    return np.clip(img, 0.0, 1.0)
-
-
-def visualize_augmentations(
-    root: str,
-    num_images: int = 8,
-    seed: int = 42,
-    save_path: str = "augmented_samples.png",
-    show: bool = False,
-):
-    """Visualize a few augmented samples from the training pipeline."""
-    rng = np.random.default_rng(seed)
-    transform = AlbumentationsTransform(train=True)
-    dataset = OxfordIIITPetDataset(
-        root=root,
-        split="trainval",
-        tasks=("category",),
-        transform=transform,
-    )
-
-    num_images = max(1, min(num_images, len(dataset)))
-    indices = rng.choice(len(dataset), size=num_images, replace=False)
-
-    cols = min(4, num_images)
-    rows = int(np.ceil(num_images / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows))
-    if rows == 1 and cols == 1:
-        axes = np.array([[axes]])
-    elif rows == 1:
-        axes = np.array([axes])
-    elif cols == 1:
-        axes = axes.reshape(rows, 1)
-
-    for idx, sample_idx in enumerate(indices):
-        image, label = dataset[int(sample_idx)]
-        img = _unnormalize_image(image)
-        r, c = divmod(idx, cols)
-        ax = axes[r, c]
-        ax.imshow(img)
-        ax.set_title(f"label: {label}")
-        ax.axis("off")
-
-    # Hide any unused subplots.
-    for idx in range(num_images, rows * cols):
-        r, c = divmod(idx, cols)
-        axes[r, c].axis("off")
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    print(f"Saved augmentation preview to {save_path}")
-    if show:
-        plt.show()
-    plt.close(fig)
-
-
-def visualize_augmentation_variants(
-    root: str,
-    num_variants: int = 8,
-    image_index: int = -1,
-    seed: int = 42,
-    save_path: str = "augmented_variants.png",
-    show: bool = False,
-):
-    """Visualize multiple augmented variants of the same image."""
-    rng = np.random.default_rng(seed)
-    base_dataset = OxfordIIITPetDataset(
-        root=root,
-        split="trainval",
-        tasks=("category",),
-        transform=None,
-    )
-    if len(base_dataset) == 0:
-        print("Dataset is empty; skipping augmentation variant visualization.")
-        return
-
-    if image_index < 0 or image_index >= len(base_dataset):
-        image_index = int(rng.integers(len(base_dataset)))
-
-    base_image, label = base_dataset[image_index]
-    base_transform = AlbumentationsTransform(train=False)
-    aug_transform = AlbumentationsTransform(train=True)
-
-    variants = [base_transform(base_image)]
-    for _ in range(max(1, num_variants)):
-        variants.append(aug_transform(base_image))
-
-    total = len(variants)
-    cols = min(4, total)
-    rows = int(np.ceil(total / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(3.5 * cols, 3.5 * rows))
-    if rows == 1 and cols == 1:
-        axes = np.array([[axes]])
-    elif rows == 1:
-        axes = np.array([axes])
-    elif cols == 1:
-        axes = axes.reshape(rows, 1)
-
-    for idx, tensor in enumerate(variants):
-        img = _unnormalize_image(tensor)
-        r, c = divmod(idx, cols)
-        ax = axes[r, c]
-        title = "base" if idx == 0 else f"aug {idx}"
-        ax.imshow(img)
-        ax.set_title(f"{title} | label: {label}")
-        ax.axis("off")
-
-    for idx in range(total, rows * cols):
-        r, c = divmod(idx, cols)
-        axes[r, c].axis("off")
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    print(f"Saved augmentation variants to {save_path}")
-    if show:
-        plt.show()
-    plt.close(fig)
 
 
 def _rand_bbox(size, lam: float):
@@ -552,12 +255,14 @@ def _rand_bbox(size, lam: float):
 
 
 def train_one_epoch(
+    task: str,
     model,
     loader,
     optimizer,
     criterion,
     device: torch.device,
     log_interval: int,
+    num_classes: int = 0,
     mixup_alpha: float = 0.0,
     cutmix_alpha: float = 0.0,
     mix_prob: float = 1.0,
@@ -566,20 +271,39 @@ def train_one_epoch(
 ):
     model.train()
     running_loss = 0.0
-    running_correct = 0
     total = 0
     start_time = time.perf_counter()
+    running_correct = 0
+    running_pixel_correct = 0
+    total_pixels = 0
+    confusion = None
 
-    for batch_idx, (images, labels) in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=device.type == "cuda")
-        labels = labels.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
+    if task == "segmentation":
+        confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64)
+        if hasattr(model, "encoder"):
+            model.encoder.eval()
+
+    for batch_idx, batch in enumerate(loader, start=1):
+        images = batch[0].to(device, non_blocking=device.type == "cuda")
+        targets = batch[1]
+
+        if task == "classification":
+            targets = targets.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
+        elif task == "segmentation":
+            targets = targets.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
+        elif task == "localization":
+            targets = targets.to(device, dtype=torch.float32, non_blocking=device.type == "cuda")
+        else:
+            raise ValueError(f"Unknown task: {task}")
 
         optimizer.zero_grad(set_to_none=True)
-        use_mix = (
-            (mixup_alpha > 0.0 or cutmix_alpha > 0.0)
-            and np.random.rand() < mix_prob
-        )
-        if use_mix and (mixup_alpha > 0.0 or cutmix_alpha > 0.0):
+
+        if task == "classification" and (mixup_alpha > 0.0 or cutmix_alpha > 0.0):
+            use_mix = np.random.rand() < mix_prob
+        else:
+            use_mix = False
+
+        if task == "classification" and use_mix:
             use_cutmix = False
             if mixup_alpha > 0.0 and cutmix_alpha > 0.0:
                 use_cutmix = np.random.rand() < 0.5
@@ -592,57 +316,74 @@ def train_one_epoch(
                 bbx1, bby1, bbx2, bby2 = _rand_bbox(images.size(), lam)
                 images[:, :, bby1:bby2, bbx1:bbx2] = images[rand_index, :, bby1:bby2, bbx1:bbx2]
                 lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (images.size(-1) * images.size(-2)))
-                labels_a, labels_b = labels, labels[rand_index]
+                labels_a, labels_b = targets, targets[rand_index]
             else:
                 lam = np.random.beta(mixup_alpha, mixup_alpha)
                 rand_index = torch.randperm(images.size(0), device=images.device)
                 images = lam * images + (1 - lam) * images[rand_index]
-                labels_a, labels_b = labels, labels[rand_index]
+                labels_a, labels_b = targets, targets[rand_index]
+
             logits = model(images)
             loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
         else:
-            logits = model(images)
-            loss = criterion(logits, labels)
+            if task in {"classification", "segmentation"}:
+                logits = model(images)
+                loss = criterion(logits, targets)
+            else:
+                logits = model(images)
+                loss = criterion(logits, targets)
+
         loss.backward()
 
         if debug_stats and batch_idx <= debug_batches:
             grad_norm = _grad_norm_l2(model)
-            logit_std = logits.detach().std().item()
-            feat_std = float("nan")
-            if hasattr(model, "encoder") and hasattr(model, "avgpool"):
-                with torch.no_grad():
-                    feats = model.avgpool(model.encoder(images))
-                    feat_std = feats.std().item()
-            print(
-                f"  debug batch {batch_idx} "
-                f"- grad_norm: {grad_norm:.6f} "
-                f"logits_std: {logit_std:.6f} "
-                f"feats_std: {feat_std:.6f}"
-            )
-        optimizer.step()
+            print(f"  debug batch {batch_idx} - grad_norm: {grad_norm:.6f}")
 
+        optimizer.step()
 
         batch_size = images.size(0)
         running_loss += loss.item() * batch_size
-        running_correct += _accuracy(logits, labels)
         total += batch_size
+
+        if task == "classification":
+            running_correct += _accuracy(logits, targets)
+        elif task == "segmentation":
+            preds = torch.argmax(logits, dim=1)
+            running_pixel_correct += (preds == targets).sum().item()
+            total_pixels += targets.numel()
+            _update_segmentation_confusion(confusion, preds, targets, num_classes)
 
         if log_interval > 0 and batch_idx % log_interval == 0:
             elapsed = time.perf_counter() - start_time
             samples_per_sec = total / max(1e-6, elapsed)
             avg_loss = running_loss / max(1, total)
-            avg_acc = running_correct / max(1, total)
-            print(
-                f"  batch {batch_idx}/{len(loader)} "
-                f"- loss: {avg_loss:.4f} acc: {avg_acc:.4f} "
-                f"({samples_per_sec:.1f} samples/s)"
-            )
+            if task == "classification":
+                avg_metric = running_correct / max(1, total)
+                metric_name = "acc"
+            elif task == "segmentation":
+                avg_metric = running_pixel_correct / max(1, total_pixels)
+                metric_name = "pix_acc"
+            else:
+                avg_metric = None
+                metric_name = ""
 
-    
+            message = f"  batch {batch_idx}/{len(loader)} - loss: {avg_loss:.4f}"
+            if avg_metric is not None:
+                message += f" {metric_name}: {avg_metric:.4f}"
+            message += f" ({samples_per_sec:.1f} samples/s)"
+            print(message)
+
     avg_loss = running_loss / max(1, total)
-    avg_acc = running_correct / max(1, total)
 
-    return avg_loss, avg_acc
+    if task == "classification":
+        avg_acc = running_correct / max(1, total)
+        return avg_loss, avg_acc
+    elif task == "segmentation":
+        pixel_acc = running_pixel_correct / max(1, total_pixels)
+        mean_iou = _mean_iou_from_confusion(confusion)
+        return avg_loss, pixel_acc, mean_iou
+    elif task == "localization":
+        return avg_loss
 
 
 def evaluate(model, loader, criterion, device: torch.device):
@@ -695,61 +436,6 @@ def _mean_iou_from_confusion(confusion: torch.Tensor, eps: float = 1e-6) -> floa
         return 0.0
     iou = true_pos[valid] / (denom[valid] + eps)
     return float(iou.mean().item())
-
-
-def train_one_epoch_segmentation(
-    model: VGG11UNet,
-    loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-    device: torch.device,
-    log_interval: int,
-    num_classes: int,
-):
-    model.train()
-    model.encoder.eval()  # keep frozen encoder BN/dropout behavior fixed
-    running_loss = 0.0
-    total_samples = 0
-    pixel_correct = 0
-    total_pixels = 0
-    confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64)
-    start_time = time.perf_counter()
-
-    for batch_idx, (images, masks) in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=device.type == "cuda")
-        masks = masks.to(device, dtype=torch.long, non_blocking=device.type == "cuda")
-
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(images)
-        loss = criterion(logits, masks)
-        loss.backward()
-        optimizer.step()
-
-        preds = torch.argmax(logits, dim=1)
-        batch_size = images.size(0)
-        running_loss += loss.item() * batch_size
-        total_samples += batch_size
-        pixel_correct += (preds == masks).sum().item()
-        total_pixels += masks.numel()
-        _update_segmentation_confusion(confusion, preds, masks, num_classes)
-
-        if log_interval > 0 and batch_idx % log_interval == 0:
-            elapsed = time.perf_counter() - start_time
-            samples_per_sec = total_samples / max(1e-6, elapsed)
-            avg_loss = running_loss / max(1, total_samples)
-            pixel_acc = pixel_correct / max(1, total_pixels)
-            mean_iou = _mean_iou_from_confusion(confusion)
-            print(
-                f"  batch {batch_idx}/{len(loader)} "
-                f"- loss: {avg_loss:.4f} pix_acc: {pixel_acc:.4f} "
-                f"miou: {mean_iou:.4f} "
-                f"({samples_per_sec:.1f} samples/s)"
-            )
-
-    avg_loss = running_loss / max(1, total_samples)
-    pixel_acc = pixel_correct / max(1, total_pixels)
-    mean_iou = _mean_iou_from_confusion(confusion)
-    return avg_loss, pixel_acc, mean_iou
 
 
 def evaluate_segmentation(
@@ -807,47 +493,6 @@ class LocalizationRegressionLoss(nn.Module):
         return self.mse_weight * self.mse(preds, targets) + self.iou_weight * self.iou(
             preds, targets
         )
-
-
-def train_one_epoch_localization(
-    model,
-    loader,
-    optimizer,
-    criterion,
-    device: torch.device,
-    log_interval: int,
-):
-    model.train()
-    running_loss = 0.0
-    total_samples = 0
-    start_time = time.perf_counter()
-
-    for batch_idx, (images, bboxes) in enumerate(loader, start=1):
-        images = images.to(device, non_blocking=device.type == "cuda")
-        bboxes = bboxes.to(device, dtype=torch.float32, non_blocking=device.type == "cuda")
-
-        optimizer.zero_grad(set_to_none=True)
-        preds = model(images)
-        loss = criterion(preds, bboxes)
-        loss.backward()
-        optimizer.step()
-
-        batch_size = images.size(0)
-        running_loss += loss.item() * batch_size
-        total_samples += batch_size
-
-        if log_interval > 0 and batch_idx % log_interval == 0:
-            elapsed = time.perf_counter() - start_time
-            samples_per_sec = total_samples / max(1e-6, elapsed)
-            avg_loss = running_loss / max(1, total_samples)
-            print(
-                f"  batch {batch_idx}/{len(loader)} "
-                f"- loss: {avg_loss:.4f} "
-                f"({samples_per_sec:.1f} samples/s)"
-            )
-
-    avg_loss = running_loss / max(1, total_samples)
-    return avg_loss
 
 
 def evaluate_localization(
@@ -997,7 +642,6 @@ def parse_args():
         help="CustomDropout mode for the classifier head.",
     )
     parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--save_path", type=str, default="classifier.pth")
     parser.add_argument(
         "--classifier_path",
@@ -1046,78 +690,15 @@ def parse_args():
         default=3,
         help="Number of initial batches to print debug stats for.",
     )
-    parser.add_argument(
-        "--aug_vis",
-        type=int,
-        default=0,
-        help="Number of augmented samples to visualize (0 disables).",
-    )
-    parser.add_argument(
-        "--aug_vis_path",
-        type=str,
-        default="augmented_samples.png",
-        help="Path to save the augmentation visualization grid.",
-    )
-    parser.add_argument(
-        "--aug_vis_show",
-        action="store_true",
-        help="Display the augmentation grid interactively.",
-    )
-    parser.add_argument(
-        "--aug_vis_only",
-        action="store_true",
-        help="Only generate augmentation visualization and exit.",
-    )
-    parser.add_argument(
-        "--aug_vis_variants",
-        type=int,
-        default=0,
-        help="Number of augmented variants of a single image to visualize (0 disables).",
-    )
-    parser.add_argument(
-        "--aug_vis_variants_path",
-        type=str,
-        default="augmented_variants.png",
-        help="Path to save the single-image augmentation grid.",
-    )
-    parser.add_argument(
-        "--aug_vis_index",
-        type=int,
-        default=-1,
-        help="Image index for variant visualization (-1 picks random).",
-    )
     return parser.parse_args()
 
 
 def run_classification_training(args, device: torch.device):
-    ran_visuals = False
-    if args.aug_vis > 0:
-        visualize_augmentations(
-            root=args.data_root,
-            num_images=args.aug_vis,
-            save_path=args.aug_vis_path,
-            show=args.aug_vis_show,
-        )
-        ran_visuals = True
-
-    if args.aug_vis_variants > 0:
-        visualize_augmentation_variants(
-            root=args.data_root,
-            num_variants=args.aug_vis_variants,
-            image_index=args.aug_vis_index,
-            save_path=args.aug_vis_variants_path,
-            show=args.aug_vis_show,
-        )
-        ran_visuals = True
-
-    if args.aug_vis_only and ran_visuals:
-        return
-
     train_loader, val_loader = build_dataloaders(
+        task="classification",
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        val_ratio=args.val_ratio,
         overfit_subset=args.overfit_subset,
         use_augmentation=not args.disable_aug,
     )
@@ -1132,7 +713,6 @@ def run_classification_training(args, device: torch.device):
         dropout_p=0.5,
         dropout_mode=args.dropout_mode,
     )
-    initialize_model_weights(model)
     model = model.to(device)
 
     if args.optimizer == "adamw":
@@ -1169,12 +749,13 @@ def run_classification_training(args, device: torch.device):
     print("Starting classification training...")
     for epoch in range(1, args.epochs + 1):
         train_loss, train_acc = train_one_epoch(
-            model,
-            train_loader,
-            optimizer,
-            criterion,
-            device,
-            args.log_interval,
+            task="classification",
+            model=model,
+            loader=train_loader,
+            optimizer=optimizer,
+            criterion=criterion,
+            device=device,
+            log_interval=args.log_interval,
             mixup_alpha=args.mixup_alpha,
             cutmix_alpha=args.cutmix_alpha,
             mix_prob=args.mix_prob,
@@ -1213,11 +794,11 @@ def run_segmentation_training(args, device: torch.device):
     if args.save_path == "classifier.pth":
         args.save_path = "unet.pth"
 
-    train_loader, val_loader = build_segmentation_dataloaders(
+    train_loader, val_loader = build_dataloaders(
+        task="segmentation",
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        val_ratio=args.val_ratio,
         overfit_subset=args.overfit_subset,
     )
     print(
@@ -1227,7 +808,6 @@ def run_segmentation_training(args, device: torch.device):
     )
 
     model = VGG11UNet(num_classes=args.seg_num_classes)
-    model.apply(_init_classifier_weights)
     load_and_freeze_encoder_from_classifier(model, args.classifier_path)
     model = model.to(device)
 
@@ -1268,7 +848,8 @@ def run_segmentation_training(args, device: torch.device):
     print(f"Using device: {device}")
     print("Starting segmentation training...")
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_pix_acc, train_miou = train_one_epoch_segmentation(
+        train_loss, train_pix_acc, train_miou = train_one_epoch(
+            task="segmentation",
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -1315,11 +896,11 @@ def run_localization_training(args, device: torch.device):
     if args.save_path == "classifier.pth":
         args.save_path = "localizer.pth"
 
-    train_loader, val_loader = build_localization_dataloaders(
+    train_loader, val_loader = build_dataloaders(
+        task="localization",
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        val_ratio=args.val_ratio,
         overfit_subset=args.overfit_subset,
     )
     print(
@@ -1329,7 +910,6 @@ def run_localization_training(args, device: torch.device):
     )
 
     model = VGG11Localizer()
-    model.apply(_init_classifier_weights)
     model = model.to(device)
 
     if args.optimizer == "adamw":
@@ -1368,7 +948,8 @@ def run_localization_training(args, device: torch.device):
     print(f"Using device: {device}")
     print("Starting localization training...")
     for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch_localization(
+        train_loss = train_one_epoch(
+            task="localization",
             model=model,
             loader=train_loader,
             optimizer=optimizer,

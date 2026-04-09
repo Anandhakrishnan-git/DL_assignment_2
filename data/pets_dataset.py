@@ -20,7 +20,7 @@ class OxfordIIITPetDataset(Dataset):
     def __init__(
         self,
         root,
-        split="trainval",              # "trainval" or "test"
+        split="train",              # "train", "val", or "test"
         tasks=("category",),          # ("category", "segmentation", "localization")
         transform=None,
         target_transform=None
@@ -31,8 +31,8 @@ class OxfordIIITPetDataset(Dataset):
         self.transform = transform
         self.target_transform = target_transform
 
-        if self.split not in ("trainval", "test"):
-            raise ValueError("split must be 'trainval' or 'test'")
+        if self.split not in ("train", "val", "test"):
+            raise ValueError("split must be 'train', 'val', or 'test'")
 
         # Allow "classification" as an alias for "category"
         self._class_key = "classification" if "classification" in self.tasks and "category" not in self.tasks else "category"
@@ -47,12 +47,17 @@ class OxfordIIITPetDataset(Dataset):
         self.masks_dir = os.path.join(self.root, "annotations", "trimaps")
         self.xml_dir = os.path.join(self.root, "annotations", "xmls")
 
-        # Annotation file
-        split_file = "trainval.txt" if self.split == "trainval" else "test.txt"
-        self.ann_path = os.path.join(self.root, "annotations", split_file)
+        # Load all samples
+        self.all_samples = self._load_all_annotations()
 
-        # Load metadata
-        self.samples = self._load_annotations()
+        # Filter by split
+        self.samples = [s for s in self.all_samples if s["split"] == self.split]
+
+        # Filter samples based on required tasks
+        if "segmentation" in self.tasks:
+            self.samples = [s for s in self.samples if os.path.isfile(s["mask_path"])]
+        if "localization" in self.tasks:
+            self.samples = [s for s in self.samples if os.path.isfile(s["xml_path"])]
 
     @staticmethod
     def colorize_segmentation_mask(mask: np.ndarray) -> np.ndarray:
@@ -137,12 +142,13 @@ class OxfordIIITPetDataset(Dataset):
             saved.append((int(idx), out_path, bbox_xyxy, bbox_xywh_norm))
         return saved
 
-    def _load_annotations(self):
+    def _load_all_annotations(self):
         samples = []
 
-        with open(self.ann_path, "r") as f:
+        # Load test samples
+        test_ann_path = os.path.join(self.root, "annotations", "test.txt")
+        with open(test_ann_path, "r") as f:
             lines = f.readlines()
-
         for line in lines:
             line = line.strip()
             if not line or line.startswith("#"):
@@ -151,24 +157,54 @@ class OxfordIIITPetDataset(Dataset):
             if len(parts) < 2:
                 continue
             img_id = parts[0]
-            label = int(parts[1]) - 1   # convert to 0-based
-
+            label = int(parts[1]) - 1  # convert to 0-based
             img_path = os.path.join(self.images_dir, img_id + ".jpg")
             mask_path = os.path.join(self.masks_dir, img_id + ".png")
             xml_path = os.path.join(self.xml_dir, img_id + ".xml")
-
-            # Skip samples with missing XML if localization task is required
-            if "localization" in self.tasks and not os.path.isfile(xml_path):
-                print(f"XML missing for: {img_id}, skipping for localization task")
-                continue
-
             samples.append({
                 "img_path": img_path,
                 "mask_path": mask_path,
                 "xml_path": xml_path,
-                "label": label
+                "label": label,
+                "split": "test"
             })
 
+        # Load trainval samples and split into train/val
+        trainval_ann_path = os.path.join(self.root, "annotations", "trainval.txt")
+        trainval_samples = []
+        with open(trainval_ann_path, "r") as f:
+            lines = f.readlines()
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            img_id = parts[0]
+            label = int(parts[1]) - 1  # convert to 0-based
+            img_path = os.path.join(self.images_dir, img_id + ".jpg")
+            mask_path = os.path.join(self.masks_dir, img_id + ".png")
+            xml_path = os.path.join(self.xml_dir, img_id + ".xml")
+            trainval_samples.append({
+                "img_path": img_path,
+                "mask_path": mask_path,
+                "xml_path": xml_path,
+                "label": label,
+                "split": "trainval"  # temporary
+            })
+
+        # Split trainval into train and val (80-20)
+        import random
+        random.seed(42)  # for reproducibility
+        random.shuffle(trainval_samples)
+        split_idx = int(0.8 * len(trainval_samples))
+        for s in trainval_samples[:split_idx]:
+            s["split"] = "train"
+        for s in trainval_samples[split_idx:]:
+            s["split"] = "val"
+
+        samples.extend(trainval_samples)
         return samples
 
     def _parse_bbox_xyxy_from_xml(self, xml_path: str) -> tuple:
@@ -247,7 +283,7 @@ class OxfordIIITPetDataset(Dataset):
 if __name__ == "__main__":
     dataset = OxfordIIITPetDataset(
         root="data",
-        split="trainval",
+        split="train",
         tasks=("category", "segmentation", "localization"),
     )
     print(f"Dataset size: {len(dataset)}")

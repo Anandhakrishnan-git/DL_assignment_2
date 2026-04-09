@@ -13,7 +13,8 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from data.pets_dataset import OxfordIIITPetDataset
-from models import VGG11Classifier, VGG11UNet
+from models import VGG11Classifier, VGG11UNet, VGG11Localizer
+from losses.iou_loss import IoULoss
 
 IMAGE_SIZE = 224
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -59,42 +60,52 @@ class SegmentationTargetTransform:
         return out
 
 
-def build_classification_test_loader(root: str, batch_size: int, num_workers: int):
+class LocalizationTargetTransform:
+    """Convert localization targets to pixel-space float tensors."""
+
+    def __init__(self, size: int = IMAGE_SIZE):
+        self.size = float(size)
+
+    def __call__(self, targets):
+        out = dict(targets)
+        if "localization" in out:
+            bbox = np.asarray(out["localization"], dtype=np.float32).reshape(4)
+            if float(np.max(np.abs(bbox))) <= 1.5:
+                bbox = bbox * self.size
+            out["localization"] = torch.tensor(bbox, dtype=torch.float32)
+        return out
+
+
+def build_test_loader(task: str, root: str, batch_size: int, num_workers: int):
     test_transform = AlbumentationsTransform()
+    if task == "classification":
+        tasks = ("category",)
+        target_transform = None
+        pin_memory = torch.cuda.is_available()
+    elif task == "segmentation":
+        tasks = ("segmentation",)
+        target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
+        pin_memory = False
+    elif task == "localization":
+        tasks = ("localization",)
+        target_transform = LocalizationTargetTransform(size=IMAGE_SIZE)
+        pin_memory = torch.cuda.is_available()
+    else:
+        raise ValueError(f"Unknown task: {task}")
+
     test_set = OxfordIIITPetDataset(
         root=root,
         split="test",
-        tasks=("category",),
+        tasks=tasks,
         transform=test_transform,
+        target_transform=target_transform,
     )
-    pin_memory = torch.cuda.is_available()
     test_loader = DataLoader(
         test_set,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-    )
-    return test_loader
-
-
-def build_segmentation_test_loader(root: str, batch_size: int, num_workers: int):
-    image_transform = AlbumentationsTransform()
-    target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
-    test_set = OxfordIIITPetDataset(
-        root=root,
-        split="test",
-        tasks=("segmentation",),
-        transform=image_transform,
-        target_transform=target_transform,
-    )
-    # Keep pin memory off to avoid rare Windows/CUDA pin-thread crashes.
-    test_loader = DataLoader(
-        test_set,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=False,
     )
     return test_loader
 
@@ -229,15 +240,6 @@ def _compute_segmentation_metrics(conf: np.ndarray):
     return metrics
 
 
-def _unnormalize_image(image_tensor: torch.Tensor) -> np.ndarray:
-    image = image_tensor.detach().cpu().float().permute(1, 2, 0).numpy()
-    image = image * np.array(IMAGENET_STD, dtype=np.float32) + np.array(
-        IMAGENET_MEAN, dtype=np.float32
-    )
-    image = np.clip(image, 0.0, 1.0)
-    return (image * 255.0).astype(np.uint8)
-
-
 def _colorize_segmentation_mask(mask: np.ndarray, num_classes: int) -> np.ndarray:
     if num_classes == 3:
         return OxfordIIITPetDataset.colorize_segmentation_mask(mask)
@@ -252,81 +254,6 @@ def _colorize_segmentation_mask(mask: np.ndarray, num_classes: int) -> np.ndarra
     ).astype(np.uint8)
     mask_clipped = np.clip(mask, 0, num_classes - 1).astype(np.int64)
     return palette[mask_clipped]
-
-
-def visualize_segmentation_prediction(
-    model: nn.Module,
-    root: str,
-    device: torch.device,
-    num_classes: int,
-    sample_index: int,
-    out_dir: str,
-    prefix: str,
-    alpha: float,
-):
-    image_transform = AlbumentationsTransform()
-    target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
-    dataset = OxfordIIITPetDataset(
-        root=root,
-        split="test",
-        tasks=("segmentation",),
-        transform=image_transform,
-        target_transform=target_transform,
-    )
-
-    if len(dataset) == 0:
-        raise RuntimeError("Empty test dataset; cannot visualize segmentation output.")
-
-    if sample_index < 0:
-        sample_index = int(np.random.randint(0, len(dataset)))
-    sample_index = int(sample_index % len(dataset))
-
-    image_tensor, gt_mask = dataset[sample_index]
-    image_batch = image_tensor.unsqueeze(0).to(device, non_blocking=device.type == "cuda")
-
-    model.eval()
-    with torch.no_grad():
-        logits = model(image_batch)
-        pred_mask = torch.argmax(logits, dim=1).squeeze(0).detach().cpu().numpy().astype(np.int64)
-
-    gt_mask_np = gt_mask.detach().cpu().numpy().astype(np.int64)
-    image_np = _unnormalize_image(image_tensor)
-    pred_color = _colorize_segmentation_mask(pred_mask, num_classes)
-    gt_color = _colorize_segmentation_mask(gt_mask_np, num_classes)
-
-    alpha = float(np.clip(alpha, 0.0, 1.0))
-    pred_overlay = ((1.0 - alpha) * image_np + alpha * pred_color).astype(np.uint8)
-    gt_overlay = ((1.0 - alpha) * image_np + alpha * gt_color).astype(np.uint8)
-
-    panel = np.concatenate(
-        [image_np, gt_color, pred_color, gt_overlay, pred_overlay],
-        axis=1,
-    )
-
-    os.makedirs(out_dir, exist_ok=True)
-    base = f"{prefix}_idx_{sample_index:04d}"
-    image_path = os.path.join(out_dir, f"{base}_image.png")
-    gt_path = os.path.join(out_dir, f"{base}_gt_mask.png")
-    pred_path = os.path.join(out_dir, f"{base}_pred_mask.png")
-    gt_overlay_path = os.path.join(out_dir, f"{base}_gt_overlay.png")
-    pred_overlay_path = os.path.join(out_dir, f"{base}_pred_overlay.png")
-    panel_path = os.path.join(out_dir, f"{base}_panel.png")
-
-    Image.fromarray(image_np).save(image_path)
-    Image.fromarray(gt_color).save(gt_path)
-    Image.fromarray(pred_color).save(pred_path)
-    Image.fromarray(gt_overlay).save(gt_overlay_path)
-    Image.fromarray(pred_overlay).save(pred_overlay_path)
-    Image.fromarray(panel).save(panel_path)
-
-    print("Saved segmentation visualization:")
-    print(f"  sample index: {sample_index}")
-    print(f"  image: {image_path}")
-    print(f"  gt mask: {gt_path}")
-    print(f"  pred mask: {pred_path}")
-    print(f"  gt overlay: {gt_overlay_path}")
-    print(f"  pred overlay: {pred_overlay_path}")
-    print(f"  panel: {panel_path}")
 
 
 def evaluate_segmentation(
@@ -396,7 +323,7 @@ def parse_args():
     parser.add_argument(
         "--task",
         type=str,
-        choices=("classification", "segmentation"),
+        choices=("classification", "segmentation", "localization"),
         default="classification",
         help="Inference task.",
     )
@@ -436,45 +363,13 @@ def parse_args():
         action="store_true",
         help="Print per-class IoU/support for segmentation.",
     )
-    parser.add_argument(
-        "--save_seg_viz",
-        action="store_true",
-        help="Save segmentation prediction visualization for one test sample.",
-    )
-    parser.add_argument(
-        "--seg_viz_index",
-        type=int,
-        default=0,
-        help="Test sample index for segmentation visualization (-1 selects random).",
-    )
-    parser.add_argument(
-        "--seg_viz_dir",
-        type=str,
-        default="segmentation_viz",
-        help="Directory where segmentation visualization files are saved.",
-    )
-    parser.add_argument(
-        "--seg_viz_prefix",
-        type=str,
-        default="segmentation_test",
-        help="Filename prefix for saved segmentation visualization files.",
-    )
-    parser.add_argument(
-        "--seg_viz_alpha",
-        type=float,
-        default=0.35,
-        help="Overlay alpha for segmentation visualization in [0, 1].",
-    )
-    parser.add_argument(
-        "--seg_viz_only",
-        action="store_true",
-        help="Only save segmentation visualization and skip full test evaluation.",
-    )
+    parser.add_argument("--localizer_path", type=str, default="localizer.pth")
     return parser.parse_args()
 
 
 def run_classification_inference(args, device: torch.device):
-    test_loader = build_classification_test_loader(
+    test_loader = build_test_loader(
+        task="classification",
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -534,20 +429,8 @@ def run_segmentation_inference(args, device: torch.device):
     load_checkpoint(model, args.unet_path, device)
     criterion = nn.CrossEntropyLoss()
 
-    if args.seg_viz_only:
-        visualize_segmentation_prediction(
-            model=model,
-            root=args.data_root,
-            device=device,
-            num_classes=args.seg_num_classes,
-            sample_index=args.seg_viz_index,
-            out_dir=args.seg_viz_dir,
-            prefix=args.seg_viz_prefix,
-            alpha=args.seg_viz_alpha,
-        )
-        return
-
-    test_loader = build_segmentation_test_loader(
+    test_loader = build_test_loader(
+        task="segmentation",
         root=args.data_root,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -577,17 +460,59 @@ def run_segmentation_inference(args, device: torch.device):
             iou = metrics["iou"][idx]
             print(f"{idx:02d}: support={support} iou={iou:.4f}")
 
-    if args.save_seg_viz:
-        visualize_segmentation_prediction(
-            model=model,
-            root=args.data_root,
-            device=device,
-            num_classes=args.seg_num_classes,
-            sample_index=args.seg_viz_index,
-            out_dir=args.seg_viz_dir,
-            prefix=args.seg_viz_prefix,
-            alpha=args.seg_viz_alpha,
-        )
+
+
+def run_localization_inference(args, device: torch.device):
+    model = VGG11Localizer().to(device)
+    load_checkpoint(model, args.localizer_path, device)
+    criterion = IoULoss()
+
+    test_loader = build_test_loader(
+        task="localization",
+        root=args.data_root,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+    print(
+        f"Test size: {len(test_loader.dataset)} | "
+        f"Batches: {len(test_loader)}"
+    )
+
+    print(f"Using device: {device}")
+    avg_loss = evaluate_localization(
+        model=model,
+        loader=test_loader,
+        device=device,
+        criterion=criterion,
+    )
+
+    print(f"Localization test loss: {avg_loss:.4f}")
+
+
+def evaluate_localization(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+):
+    model.eval()
+    running_loss = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for images, bboxes in loader:
+            images = images.to(device, non_blocking=device.type == "cuda")
+            bboxes = bboxes.to(device, dtype=torch.float32, non_blocking=device.type == "cuda")
+
+            preds = model(images)
+            loss = criterion(preds, bboxes)
+
+            batch_size = images.size(0)
+            running_loss += loss.item() * batch_size
+            total_samples += batch_size
+
+    avg_loss = running_loss / max(1, total_samples)
+    return avg_loss
 
 
 def main():
@@ -596,9 +521,12 @@ def main():
 
     if args.task == "segmentation":
         run_segmentation_inference(args, device)
-        return
-
-    run_classification_inference(args, device)
+    elif args.task == "classification":
+        run_classification_inference(args, device)
+    elif args.task == "localization":
+        run_localization_inference(args, device)
+    else:
+        raise ValueError(f"Unsupported task: {args.task}")
 
 
 if __name__ == "__main__":
