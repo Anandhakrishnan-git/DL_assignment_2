@@ -11,6 +11,12 @@
 *.sln.docstates
 *.env
 
+# Model files
+*.pth
+
+# Generated images
+*.png
+
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
 
