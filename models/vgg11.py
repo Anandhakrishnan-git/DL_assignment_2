@@ -95,4 +95,7 @@ if __name__ == "__main__":
     input_tensor = torch.randn(1, 3, 224, 224)  # Example input
     output = model(input_tensor)
     print("Output shape:", output.shape)
-    print("Features:", output)
+    avgpool = nn.AdaptiveAvgPool2d((7, 7))
+    pooled = avgpool(output)
+    print("Pooled shape:", pooled.shape)
+

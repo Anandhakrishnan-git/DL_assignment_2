@@ -334,12 +334,9 @@ def train_one_epoch(
             logits = model(images)
             loss = lam * criterion(logits, labels_a) + (1 - lam) * criterion(logits, labels_b)
         else:
-            if task in {"classification", "segmentation"}:
-                logits = model(images)
-                loss = criterion(logits, targets)
-            else:
-                logits = model(images)
-                loss = criterion(logits, targets)
+            logits = model(images)
+            loss = criterion(logits, targets)
+
 
         loss.backward()
         optimizer.step()
@@ -514,6 +511,55 @@ def evaluate_segmentation(
     return avg_loss, pixel_acc, mean_iou
 
 
+def compute_iou(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Compute IoU between predicted and target bounding boxes.
+    
+    Args:
+        pred_boxes: [B, 4] predicted boxes in (x_center, y_center, width, height) format.
+        target_boxes: [B, 4] target boxes in (x_center, y_center, width, height) format.
+        eps: Small value to avoid division by zero.
+    
+    Returns:
+        IoU values [B] for each sample in the batch.
+    """
+    pred_boxes = pred_boxes.float()
+    target_boxes = target_boxes.float()
+
+    px, py, pw, ph = pred_boxes.unbind(dim=-1)
+    tx, ty, tw, th = target_boxes.unbind(dim=-1)
+
+    pw = torch.abs(pw)
+    ph = torch.abs(ph)
+    tw = torch.abs(tw)
+    th = torch.abs(th)
+
+    px1 = px - pw / 2.0
+    py1 = py - ph / 2.0
+    px2 = px + pw / 2.0
+    py2 = py + ph / 2.0
+
+    tx1 = tx - tw / 2.0
+    ty1 = ty - th / 2.0
+    tx2 = tx + tw / 2.0
+    ty2 = ty + th / 2.0
+
+    ix1 = torch.max(px1, tx1)
+    iy1 = torch.max(py1, ty1)
+    ix2 = torch.min(px2, tx2)
+    iy2 = torch.min(py2, ty2)
+
+    inter_w = torch.clamp(ix2 - ix1, min=0.0)
+    inter_h = torch.clamp(iy2 - iy1, min=0.0)
+    inter_area = inter_w * inter_h
+
+    p_area = torch.clamp(px2 - px1, min=0.0) * torch.clamp(py2 - py1, min=0.0)
+    t_area = torch.clamp(tx2 - tx1, min=0.0) * torch.clamp(ty2 - ty1, min=0.0)
+
+    union = p_area + t_area - inter_area
+    iou = inter_area / (union + eps)
+    iou = torch.clamp(iou, min=0.0, max=1.0)
+    return iou
+
 
 def evaluate_localization(
     model,
@@ -524,6 +570,7 @@ def evaluate_localization(
     model.eval()
     running_loss = 0.0
     total_samples = 0
+    iou_values = []
 
     with torch.no_grad():
         for images, bboxes in loader:
@@ -536,9 +583,14 @@ def evaluate_localization(
             batch_size = images.size(0)
             running_loss += loss.item() * batch_size
             total_samples += batch_size
+            
+            # Compute IoU for each sample in batch
+            batch_iou = compute_iou(preds, bboxes)
+            iou_values.extend(batch_iou.cpu().numpy())
 
     avg_loss = running_loss / max(1, total_samples)
-    return avg_loss
+    avg_iou = float(np.mean(iou_values)) if iou_values else 0.0
+    return avg_loss, avg_iou
 
 
 def _extract_state_dict(checkpoint) -> dict:
@@ -563,32 +615,48 @@ def _strip_module_prefix(state_dict: dict) -> dict:
 def load_and_freeze_encoder_from_classifier(
     model: VGG11UNet,
     classifier_path: str,
-) -> None:
+) -> None:    
+
     if not os.path.isfile(classifier_path):
         raise FileNotFoundError(f"Classifier checkpoint not found: {classifier_path}")
 
+    # ---- Load checkpoint ----
     checkpoint = torch.load(classifier_path, map_location="cpu")
     state_dict = _strip_module_prefix(_extract_state_dict(checkpoint))
+
+    # ---- Extract encoder weights ----
     encoder_state = {
-        key: value for key, value in state_dict.items() if key.startswith("encoder.")
+        key.replace("encoder.", ""): value
+        for key, value in state_dict.items()
+        if key.startswith("encoder.")
     }
+
     if not encoder_state:
         raise ValueError(
             "No encoder.* keys found in classifier checkpoint; cannot initialize UNet encoder."
         )
 
-    incompatible = model.load_state_dict(encoder_state, strict=False)
+    # ---- Load into encoder ONLY ----
+    incompatible = model.encoder.load_state_dict(encoder_state, strict=False)
+
+    # ---- Freeze encoder parameters ----
     for param in model.encoder.parameters():
         param.requires_grad = False
+
+    # ---- Set encoder to eval mode (important for BatchNorm/Dropout) ----
     model.encoder.eval()
 
+    # ---- Logging ----
     print(
         f"Loaded {len(encoder_state)} encoder tensors from {classifier_path} "
         f"and froze encoder parameters."
     )
+
+    if incompatible.missing_keys:
+        print(f"Missing keys while loading encoder: {incompatible.missing_keys}")
+
     if incompatible.unexpected_keys:
         print(f"Unexpected keys while loading encoder: {incompatible.unexpected_keys}")
-
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -629,39 +697,19 @@ def run_classification_training(args, device: torch.device):
         f"Batches per epoch: {len(train_loader)}"
     )
 
-    model = VGG11Classifier(
-        num_classes=37,
-        dropout_p=0.5,
-    )
+    model = VGG11Classifier(dropout_p=0.5)
     model = model.to(device)
 
     if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,)
     else:
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,)
 
     scheduler = None
     if args.lr_scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=args.min_lr,
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr,)
     elif args.lr_scheduler == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=args.lr_factor,
-            patience=args.lr_patience,
-        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=args.lr_factor, patience=args.lr_patience,)
 
     criterion = nn.CrossEntropyLoss()
     best_acc = -1.0
@@ -709,8 +757,8 @@ def run_classification_training(args, device: torch.device):
 
 
 def run_segmentation_training(args, device: torch.device):
-    if args.save_path == "classifier.pth":
-        args.save_path = "unet.pth"
+    if args.save_path == "checkpoints/classifier.pth":
+        args.save_path = "checkpoints/unet.pth"
 
     train_loader, val_loader = build_dataloaders(
         task="segmentation",
@@ -733,32 +781,15 @@ def run_segmentation_training(args, device: torch.device):
         raise RuntimeError("No trainable parameters found for segmentation training.")
 
     if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(
-            trainable_params,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay,)
     else:
-        optimizer = torch.optim.Adam(
-            trainable_params,
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.Adam(trainable_params, lr=args.lr, weight_decay=args.weight_decay,)
 
     scheduler = None
     if args.lr_scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=args.min_lr,
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr,)
     elif args.lr_scheduler == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=args.lr_factor,
-            patience=args.lr_patience,
-        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=args.lr_factor, patience=args.lr_patience,)
 
     criterion = nn.CrossEntropyLoss()
     best_miou = -1.0
@@ -826,41 +857,25 @@ def run_localization_training(args, device: torch.device):
     )
 
     model = VGG11Localizer()
+    load_and_freeze_encoder_from_classifier(model, args.classifier_path)
     model = model.to(device)
 
     if args.optimizer == "adamw":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,)
     else:
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-        )
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,)
 
     scheduler = None
     if args.lr_scheduler == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=args.min_lr,
-        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=args.min_lr,)
     elif args.lr_scheduler == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=args.lr_factor,
-            patience=args.lr_patience,
-        )
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode="min",factor=args.lr_factor,patience=args.lr_patience,)
 
     criterion = LocalizationRegressionLoss(
         mse_weight=1.0 - args.iou_w,
         iou_weight=args.iou_w,
     )
-    best_loss = float('inf')
+    best_iou = -1.0
     print(f"Using device: {device}")
     print("Starting localization training...")
     for epoch in range(1, args.epochs + 1):
@@ -873,7 +888,7 @@ def run_localization_training(args, device: torch.device):
             device=device,
             log_interval=args.log_interval,
         )
-        val_loss = evaluate_localization(
+        val_loss, val_iou = evaluate_localization(
             model=model,
             loader=val_loader,
             criterion=criterion,
@@ -890,12 +905,12 @@ def run_localization_training(args, device: torch.device):
         print(
             f"Epoch {epoch}/{args.epochs} "
             f"- train: {train_loss:.4f} "
-            f"- val: {val_loss:.4f} "
+            f"- val: {val_loss:.4f} iou: {val_iou:.4f} "
             f"- lr: {current_lr:.2e}"
         )
 
-        if val_loss < best_loss:
-            best_loss = val_loss
+        if val_iou > best_iou:
+            best_iou = val_iou
             if args.save_path:
                 save_dir = os.path.dirname(args.save_path)
                 if save_dir:
@@ -903,7 +918,7 @@ def run_localization_training(args, device: torch.device):
                 torch.save(model.state_dict(), args.save_path)
 
     if args.save_path:
-        print(f"Best checkpoint saved to {args.save_path} (val loss: {best_loss:.4f})")
+        print(f"Best checkpoint saved to {args.save_path} (val iou: {best_iou:.4f})")
 
 
 def main():

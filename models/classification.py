@@ -16,7 +16,6 @@ class VGG11Classifier(nn.Module):
         num_classes: int = 37,
         in_channels: int = 3,
         dropout_p: float = 0.5,
-        dropout_mode: str = "channel",
     ):
         """
         Initialize the VGG11Classifier model.
