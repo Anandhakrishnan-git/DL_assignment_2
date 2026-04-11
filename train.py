@@ -615,7 +615,10 @@ def _strip_module_prefix(state_dict: dict) -> dict:
 def load_and_freeze_encoder_from_classifier(
     model: VGG11UNet,
     classifier_path: str,
-) -> None:    
+) -> None:
+
+    import os
+    import torch
 
     if not os.path.isfile(classifier_path):
         raise FileNotFoundError(f"Classifier checkpoint not found: {classifier_path}")
@@ -636,14 +639,14 @@ def load_and_freeze_encoder_from_classifier(
             "No encoder.* keys found in classifier checkpoint; cannot initialize UNet encoder."
         )
 
-    # ---- Load into encoder ONLY ----
-    incompatible = model.encoder.load_state_dict(encoder_state, strict=False)
+    # ---- CORRECT: load into inner Sequential ----
+    incompatible = model.encoder.encoder.load_state_dict(encoder_state, strict=False)
 
-    # ---- Freeze encoder parameters ----
+    # ---- Freeze encoder ----
     for param in model.encoder.parameters():
         param.requires_grad = False
 
-    # ---- Set encoder to eval mode (important for BatchNorm/Dropout) ----
+    # ---- Keep BN stable ----
     model.encoder.eval()
 
     # ---- Logging ----
