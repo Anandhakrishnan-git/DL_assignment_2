@@ -95,6 +95,7 @@ class VGG11UNet(nn.Module):
         f1 = feats["block1"]
         d5 = self.dec5(torch.cat([d5, f1], dim=1))
 
+
         return self.head(d5)
 
 if __name__ == "__main__":
