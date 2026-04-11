@@ -15,21 +15,18 @@ class VGG11Encoder(nn.Module):
         """Initialize the VGG11Encoder model."""
         super().__init__()
 
-        self.block1 = nn.Sequential(
+
+        self.encoder = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-        )
 
-        self.block2 = nn.Sequential(
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-        )
 
-        self.block3 = nn.Sequential(
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
@@ -37,9 +34,7 @@ class VGG11Encoder(nn.Module):
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-        )
 
-        self.block4 = nn.Sequential(
             nn.Conv2d(256, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
@@ -47,9 +42,7 @@ class VGG11Encoder(nn.Module):
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-        )
 
-        self.block5 = nn.Sequential(
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
@@ -57,14 +50,6 @@ class VGG11Encoder(nn.Module):
             nn.BatchNorm2d(512),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
-        )
-
-        self.encoder = nn.Sequential(
-            *self.block1,
-            *self.block2,
-            *self.block3,
-            *self.block4,
-            *self.block5,
         )
 
     def forward(
@@ -80,22 +65,22 @@ class VGG11Encoder(nn.Module):
             - if return_features=False: bottleneck feature tensor.
             - if return_features=True: (bottleneck, feature_dict).
         """
-        feature1 = self.encoder[0:2](x)  # block1
-        feature2 = self.encoder[3:6](feature1)  # block2
-        feature3 = self.encoder[7:13](feature2)  # block3
-        feature4 = self.encoder[14:20](feature3)  # block4
-        feature5 = self.encoder[21:27](feature4)  # block5
+        feature1 = self.encoder[0:3](x)  # block1
+        feature2 = self.encoder[3:7](feature1)  # block2
+        feature3 = self.encoder[7:14](feature2)  # block3
+        feature4 = self.encoder[14:21](feature3)  # block4
+        feature5 = self.encoder[21:28](feature4)  # block5
 
-        x = self.encoder[28:](feature5)  # bottleneck
+        x = self.encoder[28](feature5)  # bottleneck
 
         if return_features:
-            features = {
-                "block1": feature1,
-                "block2": feature2,
-                "block3": feature3,
-                "block4": feature4,
-                "block5": feature5,
-            }
+            features = [
+                feature1,
+                feature2,
+                feature3,
+                feature4,
+                feature5
+            ]
             return x, features
 
         return x

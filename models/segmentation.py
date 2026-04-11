@@ -76,23 +76,23 @@ class VGG11UNet(nn.Module):
         bottleneck, feats = self.encoder(x, return_features=True)
 
         d1 = self.up1(bottleneck)
-        f5 = feats["block5"]
+        f5 = feats[4]
         d1 = self.dec1(torch.cat([d1, f5], dim=1))
 
         d2 = self.up2(d1)
-        f4 = feats["block4"]
+        f4 = feats[3]
         d2 = self.dec2(torch.cat([d2, f4], dim=1))
 
         d3 = self.up3(d2)
-        f3 = feats["block3"]
+        f3 = feats[2]
         d3 = self.dec3(torch.cat([d3, f3], dim=1))
 
         d4 = self.up4(d3)
-        f2 = feats["block2"]
+        f2 = feats[1]
         d4 = self.dec4(torch.cat([d4, f2], dim=1))
 
         d5 = self.up5(d4)
-        f1 = feats["block1"]
+        f1 = feats[0]
         d5 = self.dec5(torch.cat([d5, f1], dim=1))
 
 

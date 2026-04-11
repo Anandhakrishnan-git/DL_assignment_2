@@ -617,8 +617,6 @@ def load_and_freeze_encoder_from_classifier(
     classifier_path: str,
 ) -> None:
 
-    import os
-    import torch
 
     if not os.path.isfile(classifier_path):
         raise FileNotFoundError(f"Classifier checkpoint not found: {classifier_path}")
