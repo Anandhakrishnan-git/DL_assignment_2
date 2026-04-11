@@ -675,7 +675,7 @@ def parse_args():
     parser.add_argument("--cutmix_alpha",type=float,default=0.0,help="CutMix alpha (0 disables).",)
     parser.add_argument("--mix_prob",type=float,default=1.0,help="Probability to apply MixUp/CutMix per batch.",)
     parser.add_argument("--num_workers", type=int, default=2)
-    parser.add_argument("--save_path", type=str, default="classifier.pth")
+    parser.add_argument("--save_path", type=str, default="checkpoints/classifier.pth")
     parser.add_argument("--classifier_path",type=str, default="checkpoints/classifier.pth", help="Classifier checkpoint for encoder initialization in segmentation mode.",)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--disable_aug",action="store_true",help="Disable training data augmentation.",)
