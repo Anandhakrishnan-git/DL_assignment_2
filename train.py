@@ -5,6 +5,8 @@ import inspect
 import os
 import time
 from typing import Tuple
+import wandb
+
 
 import numpy as np
 from PIL import Image
@@ -12,7 +14,7 @@ import os
 import time
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
@@ -140,7 +142,6 @@ class SegmentationTargetTransform:
                 mask = np.asarray(mask, dtype=np.int64)
             mask_img = Image.fromarray(mask.astype(np.uint8))
             mask_img = mask_img.resize((self.size, self.size), resample=Image.NEAREST)
-            # Force an owning, contiguous CPU array before tensor conversion.
             mask_arr = np.array(mask_img, dtype=np.int64, copy=True)
             out["segmentation"] = torch.tensor(mask_arr, dtype=torch.long)
         return out
@@ -155,9 +156,6 @@ class LocalizationTargetTransform:
         out = dict(targets)
         if "localization" in out:
             bbox = np.asarray(out["localization"], dtype=np.float32).reshape(4)
-
-            # Dataset stores normalized xywh in [0, 1]; convert to pixel space.
-            # This keeps training targets aligned with model outputs in pixels.
             if float(np.max(np.abs(bbox))) <= 1.5:
                 bbox = bbox * self.size
 
@@ -187,7 +185,7 @@ def build_dataloaders(
         val_transform = AlbumentationsTransform(train=False)
         target_transform = SegmentationTargetTransform(size=IMAGE_SIZE)
         tasks = ("segmentation",)
-        pin_memory = False  # Avoid issues on Windows/CUDA
+        pin_memory = False  
     elif task == "localization":
         train_transform = AlbumentationsTransform(train=False)
         val_transform = AlbumentationsTransform(train=False)
@@ -273,6 +271,7 @@ def train_one_epoch(
     device: torch.device,
     log_interval: int,
     num_classes: int = 0,
+    dice_class_index: int = 1,
     mixup_alpha: float = 0.0,
     cutmix_alpha: float = 0.0,
     mix_prob: float = 1.0,
@@ -285,6 +284,11 @@ def train_one_epoch(
     running_pixel_correct = 0
     total_pixels = 0
     confusion = None
+    dice_intersection = 0
+    dice_pred_sum = 0
+    dice_target_sum = 0
+    iou_sum = 0.0
+    iou_count = 0
 
     if task == "segmentation":
         confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64)
@@ -352,6 +356,16 @@ def train_one_epoch(
             running_pixel_correct += (preds == targets).sum().item()
             total_pixels += targets.numel()
             _update_segmentation_confusion(confusion, preds, targets, num_classes)
+            pred_fg = preds == int(dice_class_index)
+            tgt_fg = targets == int(dice_class_index)
+            dice_intersection += (pred_fg & tgt_fg).sum().item()
+            dice_pred_sum += pred_fg.sum().item()
+            dice_target_sum += tgt_fg.sum().item()
+        elif task == "localization":
+            with torch.no_grad():
+                batch_iou = compute_iou(logits.detach(), targets)
+                iou_sum += float(batch_iou.sum().item())
+                iou_count += int(batch_iou.numel())
 
         if log_interval > 0 and batch_idx % log_interval == 0:
             elapsed = time.perf_counter() - start_time
@@ -380,10 +394,12 @@ def train_one_epoch(
         return avg_loss, avg_acc
     elif task == "segmentation":
         pixel_acc = running_pixel_correct / max(1, total_pixels)
+        dice = (2.0 * float(dice_intersection)) / (float(dice_pred_sum + dice_target_sum) + 1e-6)
         mean_iou = _mean_iou_from_confusion(confusion)
-        return avg_loss, pixel_acc, mean_iou
+        return avg_loss, pixel_acc, dice, mean_iou
     elif task == "localization":
-        return avg_loss
+        avg_iou = iou_sum / max(1, iou_count)
+        return avg_loss, avg_iou
 
 
 def evaluate(model, loader, criterion, device: torch.device):
@@ -481,6 +497,7 @@ def evaluate_segmentation(
     criterion: nn.Module,
     device: torch.device,
     num_classes: int,
+    dice_class_index: int = 1,
 ):
     model.eval()
     running_loss = 0.0
@@ -488,6 +505,9 @@ def evaluate_segmentation(
     pixel_correct = 0
     total_pixels = 0
     confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64)
+    dice_intersection = 0
+    dice_pred_sum = 0
+    dice_target_sum = 0
 
     with torch.no_grad():
         for images, masks in loader:
@@ -504,11 +524,17 @@ def evaluate_segmentation(
             pixel_correct += (preds == masks).sum().item()
             total_pixels += masks.numel()
             _update_segmentation_confusion(confusion, preds, masks, num_classes)
+            pred_fg = preds == int(dice_class_index)
+            tgt_fg = masks == int(dice_class_index)
+            dice_intersection += (pred_fg & tgt_fg).sum().item()
+            dice_pred_sum += pred_fg.sum().item()
+            dice_target_sum += tgt_fg.sum().item()
 
     avg_loss = running_loss / max(1, total_samples)
     pixel_acc = pixel_correct / max(1, total_pixels)
+    dice = (2.0 * float(dice_intersection)) / (float(dice_pred_sum + dice_target_sum) + 1e-6)
     mean_iou = _mean_iou_from_confusion(confusion)
-    return avg_loss, pixel_acc, mean_iou
+    return avg_loss, pixel_acc, dice, mean_iou
 
 
 def compute_iou(pred_boxes: torch.Tensor, target_boxes: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -681,7 +707,24 @@ def parse_args():
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--disable_aug",action="store_true",help="Disable training data augmentation.",)
     parser.add_argument("--iou_w", type=float, default=0.99, help="Weight for IoU loss vs MSE loss in localization training.",)
+    # W&B
+    parser.add_argument("--project", type=str, default="dl-assignment-2")
+    parser.add_argument("--entity", type=str, default=None)
+    parser.add_argument("--name", type=str, default=None)
+    parser.add_argument("--tags", type=str, default="")
+    parser.add_argument("--mode", type=str, choices=("online", "offline", "disabled"), default="online")
     return parser.parse_args()
+
+def _init_wandb(args: argparse.Namespace, *, task: str, run_name: str, config: dict) -> None:
+    tags = [t.strip() for t in str(args.tags).split(",") if t.strip()]
+    wandb.init(
+        project=args.project,
+        entity=args.entity,
+        name=run_name,
+        tags=tags,
+        mode=args.mode,
+        config=config,
+    )
 
 
 def run_classification_training(args, device: torch.device):
@@ -701,6 +744,38 @@ def run_classification_training(args, device: torch.device):
     model = VGG11Classifier(dropout_p=0.5)
     model = model.to(device)
 
+    run_name = args.name
+    if not run_name:
+        run_name = f"classification-lr{args.lr:g}-bs{args.batch_size}-opt{args.optimizer}"
+    _init_wandb(
+        args,
+        task="classification",
+        run_name=run_name,
+        config={
+            "task": "classification",
+            "data_root": args.data_root,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "optimizer": args.optimizer,
+            "lr_scheduler": args.lr_scheduler,
+            "min_lr": args.min_lr,
+            "lr_patience": args.lr_patience,
+            "lr_factor": args.lr_factor,
+            "mixup_alpha": args.mixup_alpha,
+            "cutmix_alpha": args.cutmix_alpha,
+            "mix_prob": args.mix_prob,
+            "disable_aug": bool(args.disable_aug),
+            "num_workers": args.num_workers,
+            "save_path": args.save_path,
+            "device": str(device),
+            "train_size": int(len(train_loader.dataset)),
+            "val_size": int(len(val_loader.dataset)),
+            "trainable_params": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+        },
+    )
+
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,)
     else:
@@ -716,42 +791,60 @@ def run_classification_training(args, device: torch.device):
     best_acc = -1.0
     print(f"Using device: {device}")
     print("Starting classification training...")
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = train_one_epoch(
-            task="classification",
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device,
-            log_interval=args.log_interval,
-            mixup_alpha=args.mixup_alpha,
-            cutmix_alpha=args.cutmix_alpha,
-            mix_prob=args.mix_prob,
-        )
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+    try:
+        for epoch in range(1, args.epochs + 1):
+            epoch_t0 = time.perf_counter()
+            train_loss, train_acc = train_one_epoch(
+                task="classification",
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                criterion=criterion,
+                device=device,
+                log_interval=args.log_interval,
+                mixup_alpha=args.mixup_alpha,
+                cutmix_alpha=args.cutmix_alpha,
+                mix_prob=args.mix_prob,
+            )
+            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
 
-        if scheduler is not None:
-            if args.lr_scheduler == "plateau":
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
-        current_lr = optimizer.param_groups[0]["lr"]
+            if scheduler is not None:
+                if args.lr_scheduler == "plateau":
+                    scheduler.step(val_loss)
+                else:
+                    scheduler.step()
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            epoch_sec = time.perf_counter() - epoch_t0
 
-        print(
-            f"Epoch {epoch}/{args.epochs} "
-            f"- train: {train_loss:.4f} acc: {train_acc:.4f} "
-            f"- val: {val_loss:.4f} acc: {val_acc:.4f} "
-            f"- lr: {current_lr:.2e}"
-        )
+            wandb.log(
+                {
+                    "train/loss": train_loss,
+                    "train/acc": train_acc,
+                    "val/loss": val_loss,
+                    "val/acc": val_acc,
+                    "lr": current_lr,
+                    "time/epoch_sec": epoch_sec,
+                },
+                step=epoch,
+            )
 
-        if val_acc > best_acc:
-            best_acc = val_acc
-            if args.save_path:
-                save_dir = os.path.dirname(args.save_path)
-                if save_dir:
-                    os.makedirs(save_dir, exist_ok=True)
-                torch.save(model.state_dict(), args.save_path)
+            print(
+                f"Epoch {epoch}/{args.epochs} "
+                f"- train: {train_loss:.4f} acc: {train_acc:.4f} "
+                f"- val: {val_loss:.4f} acc: {val_acc:.4f} "
+                f"- lr: {current_lr:.2e}"
+            )
+
+            if val_acc > best_acc:
+                best_acc = val_acc
+                wandb.summary["best_val_acc"] = best_acc
+                if args.save_path:
+                    save_dir = os.path.dirname(args.save_path)
+                    if save_dir:
+                        os.makedirs(save_dir, exist_ok=True)
+                    torch.save(model.state_dict(), args.save_path)
+    finally:
+        wandb.finish()
 
     if args.save_path:
         print(f"Best checkpoint saved to {args.save_path} (val acc: {best_acc:.4f})")
@@ -781,6 +874,35 @@ def run_segmentation_training(args, device: torch.device):
     if not trainable_params:
         raise RuntimeError("No trainable parameters found for segmentation training.")
 
+    run_name = args.name
+    if not run_name:
+        run_name = f"segmentation-lr{args.lr:g}-bs{args.batch_size}-opt{args.optimizer}"
+    _init_wandb(
+        args,
+        task="segmentation",
+        run_name=run_name,
+        config={
+            "task": "segmentation",
+            "data_root": args.data_root,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "optimizer": args.optimizer,
+            "lr_scheduler": args.lr_scheduler,
+            "min_lr": args.min_lr,
+            "lr_patience": args.lr_patience,
+            "lr_factor": args.lr_factor,
+            "classifier_path": args.classifier_path,
+            "num_workers": args.num_workers,
+            "save_path": args.save_path,
+            "device": str(device),
+            "train_size": int(len(train_loader.dataset)),
+            "val_size": int(len(val_loader.dataset)),
+            "trainable_params": int(sum(p.numel() for p in trainable_params)),
+        },
+    )
+
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay,)
     else:
@@ -794,48 +916,75 @@ def run_segmentation_training(args, device: torch.device):
 
     criterion = nn.CrossEntropyLoss()
     best_miou = -1.0
+    best_dice = -1.0
     print(f"Using device: {device}")
     print("Starting segmentation training...")
-    for epoch in range(1, args.epochs + 1):
-        train_loss, train_pix_acc, train_miou = train_one_epoch(
-            task="segmentation",
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device,
-            log_interval=args.log_interval,
-            num_classes=3,
-        )
-        val_loss, val_pix_acc, val_miou = evaluate_segmentation(
-            model=model,
-            loader=val_loader,
-            criterion=criterion,
-            device=device,
-            num_classes=3,
-        )
+    try:
+        for epoch in range(1, args.epochs + 1):
+            epoch_t0 = time.perf_counter()
+            train_loss, train_pix_acc, train_dice, train_miou = train_one_epoch(
+                task="segmentation",
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                criterion=criterion,
+                device=device,
+                log_interval=args.log_interval,
+                num_classes=3,
+            )
+            val_loss, val_pix_acc, val_dice, val_miou = evaluate_segmentation(
+                model=model,
+                loader=val_loader,
+                criterion=criterion,
+                device=device,
+                num_classes=3,
+            )
 
-        if scheduler is not None:
-            if args.lr_scheduler == "plateau":
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
-        current_lr = optimizer.param_groups[0]["lr"]
+            if scheduler is not None:
+                if args.lr_scheduler == "plateau":
+                    scheduler.step(val_loss)
+                else:
+                    scheduler.step()
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            epoch_sec = time.perf_counter() - epoch_t0
 
-        print(
-            f"Epoch {epoch}/{args.epochs} "
-            f"- train: {train_loss:.4f} pix_acc: {train_pix_acc:.4f} miou: {train_miou:.4f} "
-            f"- val: {val_loss:.4f} pix_acc: {val_pix_acc:.4f} miou: {val_miou:.4f} "
-            f"- lr: {current_lr:.2e}"
-        )
+            wandb.log(
+                {
+                    "train/loss": train_loss,
+                    "train/pix_acc": train_pix_acc,
+                    "train/dice": train_dice,
+                    "train/miou": train_miou,
+                    "val/loss": val_loss,
+                    "val/pix_acc": val_pix_acc,
+                    "val/dice": val_dice,
+                    "val/miou": val_miou,
+                    "lr": current_lr,
+                    "time/epoch_sec": epoch_sec,
+                },
+                step=epoch,
+            )
 
-        if val_miou > best_miou:
-            best_miou = val_miou
-            if args.save_path:
-                save_dir = os.path.dirname(args.save_path)
-                if save_dir:
-                    os.makedirs(save_dir, exist_ok=True)
-                torch.save(model.state_dict(), args.save_path)
+            print(
+                f"Epoch {epoch}/{args.epochs} "
+                f"- train: {train_loss:.4f} pix_acc: {train_pix_acc:.4f} dice: {train_dice:.4f} miou: {train_miou:.4f} "
+                f"- val: {val_loss:.4f} pix_acc: {val_pix_acc:.4f} dice: {val_dice:.4f} miou: {val_miou:.4f} "
+                f"- lr: {current_lr:.2e}"
+            )
+
+            if val_dice > best_dice:
+                best_dice = val_dice
+                wandb.summary["best_val_dice"] = best_dice
+
+            if val_miou > best_miou:
+                best_miou = val_miou
+                wandb.summary["best_val_miou"] = best_miou
+                if args.save_path:
+                    save_dir = os.path.dirname(args.save_path)
+                    if save_dir:
+                        os.makedirs(save_dir, exist_ok=True)
+                    torch.save(model.state_dict(), args.save_path)
+    finally:
+        wandb.finish()
 
     if args.save_path:
         print(f"Best checkpoint saved to {args.save_path} (val mIoU: {best_miou:.4f})")
@@ -861,6 +1010,36 @@ def run_localization_training(args, device: torch.device):
     load_and_freeze_encoder_from_classifier(model, args.classifier_path)
     model = model.to(device)
 
+    run_name = args.name
+    if not run_name:
+        run_name = f"localization-lr{args.lr:g}-bs{args.batch_size}-opt{args.optimizer}"
+    _init_wandb(
+        args,
+        task="localization",
+        run_name=run_name,
+        config={
+            "task": "localization",
+            "data_root": args.data_root,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "optimizer": args.optimizer,
+            "lr_scheduler": args.lr_scheduler,
+            "min_lr": args.min_lr,
+            "lr_patience": args.lr_patience,
+            "lr_factor": args.lr_factor,
+            "classifier_path": args.classifier_path,
+            "iou_w": float(args.iou_w),
+            "num_workers": args.num_workers,
+            "save_path": args.save_path,
+            "device": str(device),
+            "train_size": int(len(train_loader.dataset)),
+            "val_size": int(len(val_loader.dataset)),
+            "trainable_params": int(sum(p.numel() for p in model.parameters() if p.requires_grad)),
+        },
+    )
+
     if args.optimizer == "adamw":
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay,)
     else:
@@ -879,44 +1058,62 @@ def run_localization_training(args, device: torch.device):
     best_iou = -1.0
     print(f"Using device: {device}")
     print("Starting localization training...")
-    for epoch in range(1, args.epochs + 1):
-        train_loss = train_one_epoch(
-            task="localization",
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            criterion=criterion,
-            device=device,
-            log_interval=args.log_interval,
-        )
-        val_loss, val_iou = evaluate_localization(
-            model=model,
-            loader=val_loader,
-            criterion=criterion,
-            device=device,
-        )
+    try:
+        for epoch in range(1, args.epochs + 1):
+            epoch_t0 = time.perf_counter()
+            train_loss, train_iou = train_one_epoch(
+                task="localization",
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                criterion=criterion,
+                device=device,
+                log_interval=args.log_interval,
+            )
+            val_loss, val_iou = evaluate_localization(
+                model=model,
+                loader=val_loader,
+                criterion=criterion,
+                device=device,
+            )
 
-        if scheduler is not None:
-            if args.lr_scheduler == "plateau":
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
-        current_lr = optimizer.param_groups[0]["lr"]
+            if scheduler is not None:
+                if args.lr_scheduler == "plateau":
+                    scheduler.step(val_loss)
+                else:
+                    scheduler.step()
+            current_lr = float(optimizer.param_groups[0]["lr"])
+            epoch_sec = time.perf_counter() - epoch_t0
 
-        print(
-            f"Epoch {epoch}/{args.epochs} "
-            f"- train: {train_loss:.4f} "
-            f"- val: {val_loss:.4f} iou: {val_iou:.4f} "
-            f"- lr: {current_lr:.2e}"
-        )
+            wandb.log(
+                {
+                    "train/loss": train_loss,
+                    "train/iou": train_iou,
+                    "val/loss": val_loss,
+                    "val/iou": val_iou,
+                    "lr": current_lr,
+                    "time/epoch_sec": epoch_sec,
+                },
+                step=epoch,
+            )
 
-        if val_iou > best_iou:
-            best_iou = val_iou
-            if args.save_path:
-                save_dir = os.path.dirname(args.save_path)
-                if save_dir:
-                    os.makedirs(save_dir, exist_ok=True)
-                torch.save(model.state_dict(), args.save_path)
+            print(
+                f"Epoch {epoch}/{args.epochs} "
+                f"- train: {train_loss:.4f} iou: {train_iou:.4f} "
+                f"- val: {val_loss:.4f} iou: {val_iou:.4f} "
+                f"- lr: {current_lr:.2e}"
+            )
+
+            if val_iou > best_iou:
+                best_iou = val_iou
+                wandb.summary["best_val_iou"] = best_iou
+                if args.save_path:
+                    save_dir = os.path.dirname(args.save_path)
+                    if save_dir:
+                        os.makedirs(save_dir, exist_ok=True)
+                    torch.save(model.state_dict(), args.save_path)
+    finally:
+        wandb.finish()
 
     if args.save_path:
         print(f"Best checkpoint saved to {args.save_path} (val iou: {best_iou:.4f})")

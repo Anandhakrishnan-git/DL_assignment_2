@@ -1,7 +1,16 @@
+
+
+
 # DA6401 Assignment-2 Skeleton Guide
 
 This repository is an instructional skeleton for building the complete visual perception pipeline on Oxford-IIIT Pet.
 
+
+## Wanb project report link and Git repo link: 
+
+Wandb : https://wandb.ai/me21b019-indian-institute-of-technology-madras/dl-assignment-2/reports/Building-a-Complete-Visual-Perception-Pipeline--VmlldzoxNjQ5ODc3Mg?accessToken=o00gea44zf4jl7v98jed0ldjppxweszsa6oaoc8ga34ga8hsujb3hln1h0zo9d6v
+
+Git repo : https://github.com/Anandhakrishnan-git/DL_assignment_2
 
 ### ADDITIONAL INSTRUCTIONS FOR ASSIGNMENT2:
 - Ensure VGG11 is implemented according to the official paper(https://arxiv.org/abs/1409.1556). The only difference being injecting BatchNorm and CustomDropout layers is your design choice.
