@@ -36,8 +36,108 @@ This repository is an instructional skeleton for building the complete visual pe
 
 
 
+# Assignment 2 – Submission Guidelines
 
-## Contact
+Follow the steps below carefully:
+
+---
+
+## Step 1 – Google Drive Setup
+
+Create a new folder in your Google Drive and upload all 3 model checkpoints to it:
+
+- `classifier.pth`
+- `localizer.pth`
+- `unet.pth`
+
+---
+
+## Step 2 – Get Drive IDs
+
+For each `.pth` file:
+
+1. Click the three dots (**More actions**) next to the file
+2. Click **Share → Share**
+3. Set access to **Anyone with the link**
+4. Copy the link and extract the ID
+
+**Example:**
+Link → https://drive.google.com/file/d/1t2EgeJ3TaYFSBQoC9o0ojd8Nn52XzV0i/view?usp=sharing
+ID   → 1t2EgeJ3TaYFSBQoC9o0ojd8Nn52XzV0i
+
+---
+
+## Step 3 – Update Your Code
+
+Paste these 4 lines at the **start** of the `init()` function inside `MultiTaskPerceptionModel`:
+```python
+import gdown
+gdown.download(id="<classifier.pth drive id>", output=classifier_path, quiet=False)
+gdown.download(id="<localizer.pth drive id>", output=localizer_path, quiet=False)
+gdown.download(id="<unet.pth drive id>", output=unet_path, quiet=False)
+```
+
+Replace each `<...drive id>` with the actual IDs from Step 2.
+
+---
+
+## Step 4 – Clean Up Locally
+
+Delete all 3 `.pth` files from your local `/checkpoints` folder.
+
+---
+
+## Step 5 – Push to GitHub
+
+Push the current project to GitHub. Make sure **no `.pth` files** are included.
+
+---
+
+## Step 6 – Verify Project Structure
+
+Your final project should look like this:
+
+```
+.
+├── checkpoints
+│   └── checkpoints.md
+├── data
+│   └── pets_dataset.py
+├── inference.py
+├── losses
+│   ├── __init__.py
+│   └── iou_loss.py
+├── models
+│   ├── classification.py
+│   ├── __init__.py
+│   ├── layers.py
+│   ├── localization.py
+│   ├── multitask.py
+│   ├── segmentation.py
+│   └── vgg11.py
+├── README.md
+├── requirements.txt
+└── train.py
+```
+---
+
+## Step 7 – README
+
+Make sure your README includes:
+
+- Public **WandB report** link
+- **GitHub repo** link
+
+---
+
+## Step 8 – Submit
+
+Zip the project and submit on **Gradescope**.
+
+> ⚠️ **Do NOT delete** the above created Drive folder till Assignment 2 marks are released.
+
+
+# Contact
 
 For questions or issues, please contact the teaching staff or post on the course forum.
 
