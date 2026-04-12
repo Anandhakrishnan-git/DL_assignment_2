@@ -11,43 +11,48 @@ class VGG11Encoder(nn.Module):
     """VGG11-style encoder with optional intermediate feature returns.
     """
 
-    def __init__(self, in_channels: int = 3):
+    def __init__(self, in_channels: int = 3, use_batchnorm: bool = True):
         """Initialize the VGG11Encoder model."""
         super().__init__()
 
+        bn = (
+            (lambda n: nn.BatchNorm2d(n))
+            if use_batchnorm
+            else (lambda _: nn.Identity())
+        )
 
         self.encoder = nn.Sequential(
             nn.Conv2d(in_channels, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            bn(64),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
 
             nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            bn(128),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
 
             nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
+            bn(256),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
+            bn(256),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
 
             nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
+            bn(512),
             nn.ReLU(inplace=True),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
+            bn(512),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
 
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
+            bn(512),
             nn.ReLU(inplace=True),
             nn.Conv2d(512, 512, kernel_size=3, padding=1),
-            nn.BatchNorm2d(512),
+            bn(512),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=2, stride=2),
         )
@@ -95,4 +100,3 @@ if __name__ == "__main__":
     output, features = model_with_features(input_tensor, return_features=True)
     for key, feature in features.items():
         print(f"{key} shape: {feature.shape}")
-

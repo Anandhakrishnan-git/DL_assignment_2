@@ -16,6 +16,7 @@ class VGG11Classifier(nn.Module):
         num_classes: int = 37,
         in_channels: int = 3,
         dropout_p: float = 0.5,
+        use_batchnorm: bool = True,
     ):
         """
         Initialize the VGG11Classifier model.
@@ -26,16 +27,17 @@ class VGG11Classifier(nn.Module):
             dropout_mode: CustomDropout mode ("element", "channel", "spatial").
         """
         super().__init__()
-        self.encoder = VGG11Encoder(in_channels=in_channels)
+        self.encoder = VGG11Encoder(in_channels=in_channels, use_batchnorm=use_batchnorm)
         self.avgpool = nn.AdaptiveAvgPool2d((7, 7)) # Global average pooling to reduce spatial dimensions
+        bn1d = (lambda n: nn.BatchNorm1d(n)) if use_batchnorm else (lambda _: nn.Identity())
         self.classifier = nn.Sequential(
             nn.Flatten(),
             nn.Linear(512 * 7 * 7, 2048),
-            nn.BatchNorm1d(2048),
+            bn1d(2048),
             nn.ReLU(inplace=True),
             CustomDropout(p=dropout_p),
             nn.Linear(2048, 1024),
-            nn.BatchNorm1d(1024),
+            bn1d(1024),
             nn.ReLU(inplace=True),
             CustomDropout(p=dropout_p),
             nn.Linear(1024, num_classes),

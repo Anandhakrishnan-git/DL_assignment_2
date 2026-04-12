@@ -10,7 +10,13 @@ class VGG11UNet(nn.Module):
     """U-Net style segmentation network.
     """
 
-    def __init__(self, num_classes: int = 3, in_channels: int = 3, dropout_p: float = 0.5):
+    def __init__(
+        self,
+        num_classes: int = 3,
+        in_channels: int = 3,
+        dropout_p: float = 0.5,
+        use_batchnorm: bool = True,
+    ):
         """
         Initialize the VGG11UNet model.
 
@@ -18,9 +24,10 @@ class VGG11UNet(nn.Module):
             num_classes: Number of output classes.
             in_channels: Number of input channels.
             dropout_p: Dropout probability for the segmentation head.
+            use_batchnorm: Enable BatchNorm layers in the shared VGG11 encoder.
         """
         super().__init__()
-        self.encoder = VGG11Encoder(in_channels=in_channels)
+        self.encoder = VGG11Encoder(in_channels=in_channels, use_batchnorm=use_batchnorm)
 
         # Decoder: upsample + concat skip + convs
         self.up1 = nn.ConvTranspose2d(512, 512, kernel_size=2, stride=2)

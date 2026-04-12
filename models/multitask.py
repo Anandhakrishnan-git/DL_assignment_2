@@ -72,9 +72,9 @@ class MultiTaskPerceptionModel(nn.Module):
         num_breeds: int = 37,
         seg_classes: int = 3,
         in_channels: int = 3,
-        classifier_path: str = "classifier.pth",
-        localizer_path: str = "localizer.pth",
-        unet_path: str = "unet.pth",
+        classifier_path: str = "checkpoints/classifier.pth",
+        localizer_path: str = "checkpoints/localizer.pth",
+        unet_path: str = "checkpoints/unet.pth",
     ):
         """
         Initialize the multi-task model with shared backbone and task-specific heads.
@@ -98,6 +98,12 @@ class MultiTaskPerceptionModel(nn.Module):
         localizer = VGG11Localizer(in_channels=in_channels)
         unet = VGG11UNet(num_classes=seg_classes, in_channels=in_channels)
 
+        if not os.path.exists(classifier_path):
+            import gdown
+            gdown.download(id="<classifier.pth drive id>", output=classifier_path, quiet=False)
+            gdown.download(id="<localizer.pth drive id>", output=localizer_path, quiet=False)
+            gdown.download(id="<unet.pth drive id>", output=unet_path, quiet=False)
+
         # Load pre-trained weights for each task
         print(f"Loading classifier from: {classifier_path}")
         classifier_state = _load_weights(classifier_path)
@@ -107,6 +113,9 @@ class MultiTaskPerceptionModel(nn.Module):
         
         print(f"Loading U-Net from: {unet_path}")
         unet_state = _load_weights(unet_path)
+
+        
+        
 
         # Apply weights with fallback to non-strict mode if necessary
         try:

@@ -680,7 +680,7 @@ def parse_args():
     parser.add_argument("--classifier_path",type=str, default="checkpoints/classifier.pth", help="Classifier checkpoint for encoder initialization in segmentation mode.",)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--disable_aug",action="store_true",help="Disable training data augmentation.",)
-    parser.add_argument("--iou_w", type=float, default=0.5, help="Weight for IoU loss vs MSE loss in localization training.",)
+    parser.add_argument("--iou_w", type=float, default=0.99, help="Weight for IoU loss vs MSE loss in localization training.",)
     return parser.parse_args()
 
 
@@ -872,7 +872,7 @@ def run_localization_training(args, device: torch.device):
     elif args.lr_scheduler == "plateau":
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer,mode="min",factor=args.lr_factor,patience=args.lr_patience,)
 
-    criterion = LocalizationRegressionLoss(
+    criterion =  LocalizationRegressionLoss(
         mse_weight=1.0 - args.iou_w,
         iou_weight=args.iou_w,
     )
