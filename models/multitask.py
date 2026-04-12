@@ -100,9 +100,9 @@ class MultiTaskPerceptionModel(nn.Module):
 
         if not os.path.exists(classifier_path):
             import gdown
-            gdown.download(id="<classifier.pth drive id>", output=classifier_path, quiet=False)
-            gdown.download(id="<localizer.pth drive id>", output=localizer_path, quiet=False)
-            gdown.download(id="<unet.pth drive id>", output=unet_path, quiet=False)
+            gdown.download(id="https://drive.google.com/file/d/1iILFjnvwneoVc4IpOv0LYCXH-puMrg35/view?usp=drive_link", output=classifier_path, quiet=False)
+            gdown.download(id="https://drive.google.com/file/d/1GDpdxJ0R5zjL1MuI-6juk_TsfiWMGkKV/view?usp=drive_link", output=localizer_path, quiet=False)
+            gdown.download(id="https://drive.google.com/file/d/1-C59sdLVj5QFTyo3KVEqHHIqqLYqhWFT/view?usp=sharing", output=unet_path, quiet=False)
 
         # Load pre-trained weights for each task
         print(f"Loading classifier from: {classifier_path}")
