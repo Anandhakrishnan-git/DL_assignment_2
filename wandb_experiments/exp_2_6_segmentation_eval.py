@@ -1,8 +1,4 @@
 """2.6 Segmentation evaluation: Dice vs Pixel Accuracy + 5 sample images.
-
-Use this if you already trained a U-Net checkpoint and want to log:
-  - val metrics: loss, pixel accuracy, Dice (foreground), mIoU
-  - 5 qualitative triplets: (original | GT trimap | predicted trimap)
 """
 
 from __future__ import annotations
@@ -94,7 +90,6 @@ def main() -> None:
         dice_class_index=1,
     )
 
-    # Collect sample visualizations.
     samples: List[wandb.Image] = []
     model.eval()
     with torch.no_grad():

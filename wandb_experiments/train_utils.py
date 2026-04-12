@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict
 
 import numpy as np
 import torch

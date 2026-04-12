@@ -1,8 +1,4 @@
 """2.4 Feature maps from first vs last conv layer (classifier).
-
-Loads a trained classifier checkpoint and logs feature-map grids from:
-  - first conv layer (after ReLU)
-  - last conv layer before pooling (after ReLU)
 """
 
 from __future__ import annotations

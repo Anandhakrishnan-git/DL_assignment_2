@@ -1,14 +1,4 @@
 """2.5 Object detection-style table: confidence & IoU for bbox predictions.
-
-Logs a W&B table with >=10 test images:
-  - Green: ground-truth bbox
-  - Red  : predicted bbox
-  - Columns include IoU and a simple confidence score.
-
-Confidence here is MC-Dropout confidence:
-  confidence = 1 / (1 + mean_std_px)
-where mean_std_px is the mean std-dev of bbox coords (xywh) across stochastic passes.
-This can produce high-confidence but low-IoU failures (confidently wrong).
 """
 
 from __future__ import annotations

@@ -1,14 +1,4 @@
 """2.3 Transfer Learning Showdown (Segmentation).
-
-Strategies:
-  - strict  : freeze all VGG11 encoder blocks (feature extractor)
-  - partial : freeze early blocks, fine-tune last N blocks + decoder
-  - full    : fine-tune entire network end-to-end
-
-Logs:
-  - train/val loss, pixel accuracy, Dice (foreground=class 1), mIoU
-  - time per epoch
-  - optional sample visualizations (Task 2.6 compatible)
 """
 
 from __future__ import annotations

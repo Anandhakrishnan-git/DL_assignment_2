@@ -1,7 +1,6 @@
 """2.1 BatchNorm: LR range test (max stable LR proxy).
 
 Runs a short "LR finder" style sweep where LR increases exponentially each step.
-Compare BN ON vs OFF to estimate the maximum stable LR.
 """
 
 from __future__ import annotations

@@ -1,10 +1,4 @@
-"""2.7 Final pipeline showcase on novel images (not from dataset).
-
-For each input image:
-  1) Predict bbox (localizer)
-  2) Crop using predicted bbox
-  3) Classify crop (classifier) + predict trimap (U-Net)
-  4) Log a 3-panel visualization to W&B
+"""2.7 Final pipeline showcase on novel images.
 """
 
 from __future__ import annotations

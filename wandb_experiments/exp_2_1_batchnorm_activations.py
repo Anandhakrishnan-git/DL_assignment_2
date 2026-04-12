@@ -1,12 +1,4 @@
 """2.1 BatchNorm: activation distributions + convergence.
-
-Run twice:
-  - BatchNorm ON
-  - BatchNorm OFF
-
-Compare:
-  - train/val curves
-  - `activations/conv3_relu` histogram over epochs (same fixed input)
 """
 
 from __future__ import annotations

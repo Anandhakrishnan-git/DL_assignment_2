@@ -1,11 +1,4 @@
 """2.2 Internal Dynamics: No Dropout vs p=0.2 vs p=0.5.
-
-Run this script three times with:
-  --dropout_p 0.0
-  --dropout_p 0.2
-  --dropout_p 0.5
-
-W&B will overlay the curves across runs in the same project.
 """
 
 from __future__ import annotations
